@@ -1,0 +1,89 @@
+# FLRM Control System And SDSAHA
+
+Python implementations of the optimization algorithms used for the flexible link manipulator control experiments.
+
+Included algorithms:
+
+- DSI-C2oDE
+- EDA++
+- OPMWADE
+- RND
+- TPDE
+
+The repository includes the Python source code, required Problem 21 initialization data, and the requested experiment runner. Runtime outputs are written to `results/` and are intentionally not tracked by git.
+
+## Environment
+
+Create and activate a Python environment, then install the dependencies:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+On Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run One Algorithm
+
+Run OPMWADE on Problem 21 with adaptive damping, target angle 1.05 rad, and tip mass 9.78 g:
+
+```bash
+python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978
+```
+
+Run all supported algorithms on Problem 21:
+
+```bash
+python run_algorithm.py --algorithm all --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978
+```
+
+Use `--max-nfes` for a quick smoke test:
+
+```bash
+python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --max-nfes 1 --no-save
+```
+
+## Run Requested Experiments
+
+Print the scheduled experiment list without running:
+
+```bash
+python run_requested_experiments.py --dry-run
+```
+
+Run the full requested experiment batch:
+
+```bash
+python run_requested_experiments.py
+```
+
+The script writes:
+
+- `results/requested_experiments/<timestamp>/summary.csv`
+- `results/requested_experiments/<timestamp>/summary.json`
+- `results/requested_experiments/<timestamp>/process/*.npz`
+
+## Initialization Data
+
+Problem 21 initialization files are stored in `init_data/`. The `none`, `fixed`, and `adaptive` data files for the same target angle are generated from a shared 16-dimensional master population, so shared variables are identical across damping modes.
+
+Regenerate matched initialization data for one target angle:
+
+```bash
+python init_data/generate_init_data.py --evals 21 --seed 1 --target-angle 1.05 --all-damping-modes
+```
+
+Regenerate all three target angles used by the requested experiments:
+
+```bash
+python init_data/generate_init_data.py --evals 21 --seed 1 --target-angle 1.05 --all-damping-modes
+python init_data/generate_init_data.py --evals 21 --seed 1 --target-angle 1.57 --all-damping-modes
+python init_data/generate_init_data.py --evals 21 --seed 1 --target-angle 2.09 --all-damping-modes
+```
