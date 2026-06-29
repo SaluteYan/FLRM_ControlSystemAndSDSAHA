@@ -70,6 +70,8 @@ class RunnerOptions:
     map_type: str
     rnd_hessian_mode: str
     progress_interval: int
+    dsi_max_surrogate_samples: int
+    dsi_w_max: int
 
 
 def build_experiments() -> list[Experiment]:
@@ -112,6 +114,8 @@ def runner_options_from_args(args: argparse.Namespace) -> RunnerOptions:
         map_type=args.map_type,
         rnd_hessian_mode=args.rnd_hessian_mode,
         progress_interval=args.progress_interval,
+        dsi_max_surrogate_samples=args.dsi_max_surrogate_samples,
+        dsi_w_max=args.dsi_w_max,
     )
 
 
@@ -140,6 +144,9 @@ def runner_kwargs(experiment: Experiment, options: RunnerOptions, init_file: Pat
     if experiment.algorithm == "rnd":
         kwargs["hessian_mode"] = options.rnd_hessian_mode
         kwargs["perturbation"] = None
+    if experiment.algorithm == "dsi-c2ode":
+        kwargs["max_surrogate_samples"] = options.dsi_max_surrogate_samples
+        kwargs["w_max"] = options.dsi_w_max
     return kwargs
 
 
@@ -368,6 +375,18 @@ def parse_args() -> argparse.Namespace:
         default=500,
         help="Print progress every N function evaluations inside each optimization run. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--dsi-max-surrogate-samples",
+        type=int,
+        default=dsi_c2ode.DEFAULT_MAX_SURROGATE_SAMPLES,
+        help="DSI-C2oDE only: cap retained surrogate training samples. Use 0 to keep all samples.",
+    )
+    parser.add_argument(
+        "--dsi-w-max",
+        type=int,
+        default=dsi_c2ode.DEFAULT_W_MAX,
+        help="DSI-C2oDE only: maximum search intensity.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the scheduled experiments without running them.")
     parser.add_argument(
         "--save-algorithm-mat",
@@ -385,6 +404,10 @@ def main() -> None:
         experiments = experiments[: args.limit]
     if args.progress_interval < 0:
         raise SystemExit("--progress-interval must be >= 0.")
+    if args.dsi_max_surrogate_samples < 0:
+        raise SystemExit("--dsi-max-surrogate-samples must be >= 0.")
+    if args.dsi_w_max < 1:
+        raise SystemExit("--dsi-w-max must be >= 1.")
     unique_runs = unique_experiments(experiments)
     workers = resolve_worker_count(args.workers, len(unique_runs))
     if args.save_algorithm_mat and workers > 1:

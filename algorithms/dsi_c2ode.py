@@ -27,6 +27,10 @@ from .common import (
 
 
 PYTHON_INIT_DIR = WORKSPACE_ROOT / "init_data"
+DEFAULT_MAX_SURROGATE_SAMPLES = 512
+DEFAULT_W_INITIAL = 10
+DEFAULT_W_MIN = 5
+DEFAULT_W_MAX = 40
 
 
 class SurrogateModel:
@@ -34,35 +38,54 @@ class SurrogateModel:
         self.x = np.asarray(x, dtype=float)
         self.y = np.asarray(y, dtype=float).reshape(-1)
         self.zero_when_all_y_zero = zero_when_all_y_zero
+        self._phi_pinv: np.ndarray | None = None
         self.phi = self._gram(self.x, self.x)
         if zero_when_all_y_zero and np.all(self.y == 0):
             self.weights = np.zeros(self.phi.shape[1])
         else:
-            self.weights = np.linalg.lstsq(self.phi.T @ self.phi, self.phi.T @ self.y, rcond=None)[0]
+            self.weights = np.linalg.lstsq(self.phi, self.y, rcond=None)[0]
         design = np.column_stack([np.ones(self.x.shape[0]), self.x])
         self.beta = np.linalg.lstsq(design, self.y, rcond=None)[0]
         if np.any(~np.isfinite(self.weights)):
             self.weights = np.zeros(self.phi.shape[1])
+        if np.any(~np.isfinite(self.beta)):
+            self.beta = np.zeros(self.x.shape[1] + 1)
 
     @staticmethod
     def _gram(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         diff = a[:, None, :] - b[None, :, :]
         return np.linalg.norm(diff, axis=2) ** 3
 
+    @staticmethod
+    def _as_2d(x: np.ndarray) -> np.ndarray:
+        arr = np.asarray(x, dtype=float)
+        if arr.ndim == 1:
+            return arr.reshape(1, -1)
+        return arr
+
     def predict(self, x: np.ndarray) -> float:
-        xx = np.asarray(x, dtype=float).reshape(1, -1)
-        phi_x = self._gram(xx, self.x).reshape(-1)
-        return float(phi_x @ self.weights + np.r_[1.0, xx.reshape(-1)] @ self.beta)
+        return float(self.predict_many(x).reshape(-1)[0])
+
+    def predict_many(self, x: np.ndarray) -> np.ndarray:
+        xx = self._as_2d(x)
+        phi_x = self._gram(xx, self.x)
+        design = np.column_stack([np.ones(xx.shape[0]), xx])
+        return phi_x @ self.weights + design @ self.beta
 
     def uncertainty(self, x: np.ndarray) -> float:
-        xx = np.asarray(x, dtype=float).reshape(1, -1)
+        return float(self.uncertainty_many(x).reshape(-1)[0])
+
+    def uncertainty_many(self, x: np.ndarray) -> np.ndarray:
+        xx = self._as_2d(x)
         phi_x = self._gram(xx, self.x)
         try:
-            value = -(phi_x @ np.linalg.pinv(self.phi) @ phi_x.T)
+            if self._phi_pinv is None:
+                self._phi_pinv = np.linalg.pinv(self.phi)
+            values = -np.sum((phi_x @ self._phi_pinv) * phi_x, axis=1)
         except np.linalg.LinAlgError:
-            value = np.array([[0.0]])
-        uncertainty = float(value.reshape(-1)[0])
-        return uncertainty if np.isfinite(uncertainty) and uncertainty > 0 else 0.0
+            values = np.zeros(xx.shape[0])
+        values = np.where(np.isfinite(values) & (values > 0), values, 0.0)
+        return values
 
 
 def feasibility_rule_better(
@@ -95,6 +118,42 @@ def influence_scores(model: SurrogateModel, x: np.ndarray) -> np.ndarray:
     """Approximate the per-sample influence term I_i from the paper."""
     phi = np.linalg.norm(model.x - np.asarray(x, dtype=float).reshape(1, -1), axis=1) ** 3
     return model.weights * phi
+
+
+def limit_training_samples(
+    samples: np.ndarray,
+    values: np.ndarray,
+    max_samples: int | None,
+    elite_fraction: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray]:
+    if max_samples is None or max_samples <= 0 or samples.shape[0] <= max_samples:
+        return samples, values
+
+    max_samples = int(max_samples)
+    finite_indices = np.where(np.isfinite(values))[0]
+    elite_count = min(int(max_samples * elite_fraction), finite_indices.size)
+    if elite_count > 0:
+        elite_indices = finite_indices[np.argsort(values[finite_indices])[:elite_count]]
+    else:
+        elite_indices = np.empty(0, dtype=int)
+
+    recent_count = max_samples - elite_indices.size
+    recent_start = max(0, samples.shape[0] - recent_count)
+    recent_indices = np.arange(recent_start, samples.shape[0], dtype=int)
+    keep_indices = np.unique(np.concatenate([elite_indices, recent_indices]))
+
+    if keep_indices.size < max_samples:
+        keep_set = set(int(idx) for idx in keep_indices)
+        fill: list[int] = []
+        for idx in range(samples.shape[0] - 1, -1, -1):
+            if idx in keep_set:
+                continue
+            fill.append(idx)
+            if len(fill) >= max_samples - keep_indices.size:
+                break
+        keep_indices = np.unique(np.concatenate([keep_indices, np.array(fill, dtype=int)]))
+
+    return samples[keep_indices], values[keep_indices]
 
 
 def get_epsilon(nfes: int, nfes_max: int, p: float, eps_init: float) -> float:
@@ -216,8 +275,8 @@ def c2ode(
         eps = get_epsilon(state.nfes, state.nfes_max, 0.5, eps_init)
         for person_idx in range(np_g):
             u = mutation_and_crossover(pop, f_pool, cr_pool, pop[person_idx], gbest, fbest, pop_max, pop_min, evals, person_idx)
-            u_fitness = np.array([surrogate_model.predict(row) for row in u])
-            u_penalty = np.array([surrogate_model_con.predict(row) for row in u])
+            u_fitness = surrogate_model.predict_many(u)
+            u_penalty = surrogate_model_con.predict_many(u)
             best_idx = feasibility_rule_best_index(u_fitness, u_penalty)
             pop_next[person_idx], fitness[person_idx], penalty[person_idx] = epsilon_select(
                 u[best_idx],
@@ -229,8 +288,8 @@ def c2ode(
                 eps,
             )
         pop = restart_scheme(pop_next.copy(), fitness, penalty, mu, pop_max, pop_min, evals)
-        fitness = np.array([surrogate_model.predict(row) for row in pop])
-        penalty = np.array([surrogate_model_con.predict(row) for row in pop])
+        fitness = surrogate_model.predict_many(pop)
+        penalty = surrogate_model_con.predict_many(pop)
         if w_index == w_mid:
             pop_mid = pop.copy()
         elif w_index == int(w):
@@ -239,14 +298,14 @@ def c2ode(
 
 
 def find_potentially_good_solution(candidates: np.ndarray, model: SurrogateModel, con_model: SurrogateModel) -> tuple[np.ndarray, float]:
-    fitness = np.array([model.predict(row) for row in candidates])
-    penalty = np.array([con_model.predict(row) for row in candidates])
+    fitness = model.predict_many(candidates)
+    penalty = con_model.predict_many(candidates)
     best_idx = feasibility_rule_best_index(fitness, penalty)
     return candidates[best_idx].copy(), float(fitness[best_idx])
 
 
 def find_most_uncertain_solution(candidates: np.ndarray, model: SurrogateModel) -> tuple[np.ndarray, float]:
-    uncertainties = np.array([model.uncertainty(row) for row in candidates])
+    uncertainties = model.uncertainty_many(candidates)
     idx = int(np.argmax(uncertainties))
     return candidates[idx].copy(), float(uncertainties[idx])
 
@@ -470,6 +529,10 @@ def run(
     tip_mass: float | None = None,
     progress_interval: int = 0,
     progress_label: str | None = None,
+    max_surrogate_samples: int | None = DEFAULT_MAX_SURROGATE_SAMPLES,
+    w_initial: int = DEFAULT_W_INITIAL,
+    w_min: int = DEFAULT_W_MIN,
+    w_max: int = DEFAULT_W_MAX,
 ) -> list[RunResult]:
     if seed is not None:
         np.random.seed(seed)
@@ -494,6 +557,9 @@ def run(
                 np_g, _ = population_size(evals, pop_dim, dsi=True)
             np_g = max(1, min(np_g, state.nfes_max))
             state.np_g = np_g
+            sample_limit = None
+            if max_surrogate_samples is not None and max_surrogate_samples > 0:
+                sample_limit = max(int(max_surrogate_samples), np_g)
 
             pop = load_initial_population(
                 evals,
@@ -512,14 +578,29 @@ def run(
             process = process_db_best_record(process, db, state.nfes)
             current_best, _ = evaluated_best_and_fearate(db)
             _, current_fearate = best_and_fearate(pop, fitness, cons, evals)
-            reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
+            reporter.maybe(
+                state,
+                best=current_best,
+                fearate=current_fearate,
+                extra={"iter": 0, "np": state.np_g, "w": int(w_initial), "train": pop_surrogate.shape[0]},
+            )
 
-            w = 10
-            w_max = 80
-            w_min = 5
+            w = max(1, int(w_initial))
+            w_min = max(1, int(w_min))
+            w_max = max(w_min, int(w_max))
             iteration_index = 0
             while state.nfes < state.nfes_max:
                 iteration_index += 1
+                pop_surrogate, pop_surrogate_fitness = limit_training_samples(
+                    pop_surrogate,
+                    pop_surrogate_fitness,
+                    sample_limit,
+                )
+                pop_surrogate_con, pop_surrogate_con_cons = limit_training_samples(
+                    pop_surrogate_con,
+                    pop_surrogate_con_cons,
+                    sample_limit,
+                )
                 surrogate = SurrogateModel(pop_surrogate, pop_surrogate_fitness)
                 surrogate_con = SurrogateModel(pop_surrogate_con, pop_surrogate_con_cons, zero_when_all_y_zero=True)
                 pop_end, pop_mid = c2ode(pop, w, surrogate, np_g, fitness.copy(), cons.copy(), pop_max, pop_min, evals, surrogate_con, state)
@@ -565,12 +646,18 @@ def run(
                     state,
                     best=current_best,
                     fearate=current_fearate,
-                    extra={"iter": iteration_index, "np": state.np_g},
+                    extra={"iter": iteration_index, "np": state.np_g, "w": w, "train": pop_surrogate.shape[0]},
                 )
 
             best, _ = evaluated_best_and_fearate(db)
             _, fearate = best_and_fearate(pop, fitness, cons, evals)
-            reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
+            reporter.maybe(
+                state,
+                best=best,
+                fearate=fearate,
+                extra={"iter": iteration_index, "np": state.np_g, "w": w, "train": pop_surrogate.shape[0]},
+                force=True,
+            )
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)

@@ -56,6 +56,16 @@ Use `--max-nfes` for a quick smoke test:
 python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --max-nfes 1 --no-save
 ```
 
+DSI-C2oDE uses a surrogate model and can become expensive when every evaluated
+sample is retained. The default run keeps the standard Problem 21 population
+size, bounds the surrogate archive, and caps the search intensity:
+
+```bash
+python run_algorithm.py --algorithm dsi-c2ode --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --dsi-max-surrogate-samples 512 --dsi-w-max 40
+```
+
+Use `--dsi-max-surrogate-samples 0 --dsi-w-max 80` to move closer to the previous slower settings.
+
 ## Run Requested Experiments
 
 Print the scheduled experiment list without running:
@@ -82,6 +92,12 @@ Progress is printed every 500 function evaluations by default. Adjust it with `-
 
 ```bash
 conda run --no-capture-output -n algorithm_py_env python run_requested_experiments.py --workers 0 --progress-interval 1000
+```
+
+The requested experiment runner exposes the same DSI-C2oDE controls:
+
+```bash
+conda run --no-capture-output -n algorithm_py_env python run_requested_experiments.py --workers 0 --dsi-max-surrogate-samples 512 --dsi-w-max 40
 ```
 
 `--max-nfes` limits real objective evaluations. For RND this includes the hidden finite-difference objective calls used for numerical gradients and Hessian terms.

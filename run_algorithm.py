@@ -81,6 +81,24 @@ def main() -> None:
     parser.add_argument("--rnd-hessian-mode", choices=["diagonal", "full"], default="diagonal")
     parser.add_argument("--rnd-perturbation", default="none", help="RND only: none, constant:value, or uniform:min:max")
     parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=0,
+        help="Print progress every N real objective evaluations. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--dsi-max-surrogate-samples",
+        type=int,
+        default=dsi_c2ode.DEFAULT_MAX_SURROGATE_SAMPLES,
+        help="DSI-C2oDE only: cap retained surrogate training samples. Use 0 to keep all samples.",
+    )
+    parser.add_argument(
+        "--dsi-w-max",
+        type=int,
+        default=dsi_c2ode.DEFAULT_W_MAX,
+        help="DSI-C2oDE only: maximum search intensity.",
+    )
+    parser.add_argument(
         "--init-data-root",
         default=None,
         help="Folder with shared PrG{evals}InitData files. Defaults to converted_python_algorithms/init_data.",
@@ -110,6 +128,12 @@ def main() -> None:
     set_trajectory_damping_mode(damping_mode)
     if args.tip_mass <= 0:
         parser.error("--tip-mass must be positive.")
+    if args.progress_interval < 0:
+        parser.error("--progress-interval must be >= 0.")
+    if args.dsi_max_surrogate_samples < 0:
+        parser.error("--dsi-max-surrogate-samples must be >= 0.")
+    if args.dsi_w_max < 1:
+        parser.error("--dsi-w-max must be >= 1.")
 
     evals_values = parse_evals(args.evals)
     if args.target_angle is not None:
@@ -134,12 +158,16 @@ def main() -> None:
         if name == "rnd":
             extra["hessian_mode"] = args.rnd_hessian_mode
             extra["perturbation"] = parse_rnd_perturbation(args.rnd_perturbation)
+        if name == "dsi-c2ode":
+            extra["max_surrogate_samples"] = args.dsi_max_surrogate_samples
+            extra["w_max"] = args.dsi_w_max
         results = RUNNERS[name](
             evals_range=evals_values,
             repeat_num=args.repeat,
             seed=args.seed,
             max_nfes=args.max_nfes,
             save=not args.no_save,
+            progress_interval=args.progress_interval,
             **extra,
         )
         for result in results:
