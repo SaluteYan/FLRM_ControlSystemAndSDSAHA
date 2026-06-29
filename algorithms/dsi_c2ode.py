@@ -18,7 +18,6 @@ from .common import (
     iteration_setting,
     load_initial_population,
     population_size,
-    process_best_record,
     save_mat,
     set_initial_scope,
     set_problem21_tip_mass,
@@ -58,12 +57,12 @@ class SurrogateModel:
     def uncertainty(self, x: np.ndarray) -> float:
         xx = np.asarray(x, dtype=float).reshape(1, -1)
         phi_x = self._gram(xx, self.x)
-        matrix = self.phi.T @ self.phi
         try:
-            value = phi_x @ np.linalg.pinv(matrix) @ phi_x.T
+            value = -(phi_x @ np.linalg.pinv(self.phi) @ phi_x.T)
         except np.linalg.LinAlgError:
             value = np.array([[0.0]])
-        return float(value.reshape(-1)[0])
+        uncertainty = float(value.reshape(-1)[0])
+        return uncertainty if np.isfinite(uncertainty) and uncertainty > 0 else 0.0
 
 
 def feasibility_rule_better(
@@ -109,8 +108,8 @@ def get_epsilon(nfes: int, nfes_max: int, p: float, eps_init: float) -> float:
 
 def binomial_crossover(v: np.ndarray, person: np.ndarray, cr: float) -> np.ndarray:
     out = np.zeros_like(v)
+    rand_j = np.random.randint(v.size)
     for i in range(v.size):
-        rand_j = np.random.randint(v.size)
         out[i] = v[i] if np.random.rand() < cr or i == rand_j else person[i]
     return out
 
@@ -125,10 +124,14 @@ def mutation_and_crossover(
     pop_max: np.ndarray,
     pop_min: np.ndarray,
     evals: int,
+    person_idx: int,
 ) -> np.ndarray:
     rows, cols = pop.shape
     u = np.zeros((3, cols))
-    rand_idx = np.random.randint(rows, size=4)
+    available = np.array([idx for idx in range(rows) if idx != person_idx], dtype=int)
+    if available.size == 0:
+        available = np.arange(rows)
+    rand_idx = np.random.choice(available, size=4, replace=available.size < 4)
 
     f = float(np.random.choice(f_pool))
     v1 = person + np.random.rand() * (pop[rand_idx[0]] - person) + f * (pop[rand_idx[1]] - pop[rand_idx[2]])
@@ -212,7 +215,7 @@ def c2ode(
         fbest = pop[int(np.argmin(fitness))]
         eps = get_epsilon(state.nfes, state.nfes_max, 0.5, eps_init)
         for person_idx in range(np_g):
-            u = mutation_and_crossover(pop, f_pool, cr_pool, pop[person_idx], gbest, fbest, pop_max, pop_min, evals)
+            u = mutation_and_crossover(pop, f_pool, cr_pool, pop[person_idx], gbest, fbest, pop_max, pop_min, evals, person_idx)
             u_fitness = np.array([surrogate_model.predict(row) for row in u])
             u_penalty = np.array([surrogate_model_con.predict(row) for row in u])
             best_idx = feasibility_rule_best_index(u_fitness, u_penalty)
@@ -278,9 +281,61 @@ def search_intensity_adjustment(s_fitness: np.ndarray, s_cons: np.ndarray, w: in
     return int(max(min(w_max, new_w), w_min))
 
 
+def evaluated_best_and_fearate(db: np.ndarray) -> tuple[float, float]:
+    feasible = db[:, -1] <= 0
+    values = db[feasible, -2]
+    best = float(np.min(values)) if values.size else float("inf")
+    return best, float(np.sum(feasible) / db.shape[0])
+
+
+def process_db_best_record(process: np.ndarray, db: np.ndarray, nfes: int) -> np.ndarray:
+    best, _ = evaluated_best_and_fearate(db)
+    if not np.isfinite(best):
+        return process
+    row = np.array([[best, float(nfes)]])
+    if process.size == 0:
+        return row
+    row[0, 0] = min(row[0, 0], process[-1, 0])
+    return np.vstack([process, row])
+
+
+def environmental_select(
+    pop: np.ndarray,
+    fitness: np.ndarray,
+    cons: np.ndarray,
+    samples: np.ndarray,
+    sample_fitness: np.ndarray,
+    sample_cons: np.ndarray,
+    np_g: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    candidate_pop = np.vstack([pop, samples])
+    candidate_fitness = np.concatenate([fitness, sample_fitness])
+    candidate_cons = np.concatenate([cons, sample_cons])
+    feasible = candidate_cons <= 0
+    if np.any(feasible):
+        feasible_indices = np.where(feasible)[0]
+        infeasible_indices = np.where(~feasible)[0]
+        feasible_order = feasible_indices[np.argsort(candidate_fitness[feasible_indices])]
+        infeasible_order = infeasible_indices[np.argsort(candidate_cons[infeasible_indices])]
+        order = np.concatenate([feasible_order, infeasible_order])
+    else:
+        order = np.argsort(candidate_cons)
+    selected = order[:np_g]
+    return candidate_pop[selected], candidate_fitness[selected], candidate_cons[selected]
+
+
 def _append_row(matrix: np.ndarray, row: np.ndarray) -> np.ndarray:
     row = row.reshape(1, -1)
     return row if matrix.size == 0 else np.vstack([matrix, row])
+
+
+def _append_training_samples(
+    pop_surrogate: np.ndarray,
+    values: np.ndarray,
+    samples: np.ndarray,
+    sample_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    return np.vstack([pop_surrogate, samples]), np.concatenate([values, sample_values])
 
 
 def _move_training_sample_to_drm(
@@ -315,21 +370,23 @@ def _restore_from_drm(
     con_values: np.ndarray,
     drm: np.ndarray,
     feasible: bool,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if drm.size == 0:
-        return pop_con, con_values
+        return pop_con, con_values, drm
 
     if feasible:
-        candidates = drm[drm[:, -1] <= 0]
+        candidate_indices = np.where(drm[:, -1] <= 0)[0]
     else:
-        candidates = drm[drm[:, -1] > 0]
-    if candidates.shape[0] == 0:
-        return pop_con, con_values
+        candidate_indices = np.where(drm[:, -1] > 0)[0]
+    if candidate_indices.size == 0:
+        return pop_con, con_values, drm
 
-    selected = candidates[np.random.randint(candidates.shape[0])]
+    selected_idx = int(candidate_indices[np.random.randint(candidate_indices.size)])
+    selected = drm[selected_idx]
     pop_con = np.vstack([pop_con, selected[:-1]])
     con_values = np.concatenate([con_values, [selected[-1]]])
-    return pop_con, con_values
+    drm = np.delete(drm, selected_idx, axis=0)
+    return pop_con, con_values, drm
 
 
 def data_selection(
@@ -347,64 +404,57 @@ def data_selection(
     cons: np.ndarray,
     drm: np.ndarray,
     np_g: int,
-    evals: int,
-    state: EvalState,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    s_end = s[1]
-    s_end_cons = s_cons[1]
-    s_end_pred = surrogate_model_con.predict(s_end)
-    influence = influence_scores(surrogate_model_con, s_end)
+    if s.shape[0] == 2:
+        s_end = s[1]
+        s_end_cons = s_cons[1]
+        s_end_pred = surrogate_model_con.predict(s_end)
+        influence = influence_scores(surrogate_model_con, s_end)
 
-    if s_end_cons > 0 and s_end_pred <= 0:
-        # Case 4 in the paper: an infeasible solution is predicted as feasible.
-        # Remove the feasible Dcon sample with the smallest influence, then
-        # restore one infeasible removed sample if Drm contains one.
-        feasible = pop_surrogate_con_cons <= 0
-        pop_surrogate_con, pop_surrogate_con_cons, drm = _move_training_sample_to_drm(
-            pop_surrogate_con,
-            pop_surrogate_con_cons,
-            feasible,
-            influence,
-            "min",
-            drm,
-        )
-        pop_surrogate_con, pop_surrogate_con_cons = _restore_from_drm(
-            pop_surrogate_con,
-            pop_surrogate_con_cons,
-            drm,
-            feasible=False,
-        )
-    elif s_end_cons <= 0 and s_end_pred > 0:
-        # Case 3 in the paper: a feasible solution is predicted as infeasible.
-        # Remove the infeasible Dcon sample with the largest influence, then
-        # restore one feasible removed sample if Drm contains one.
-        infeasible = pop_surrogate_con_cons > 0
-        pop_surrogate_con, pop_surrogate_con_cons, drm = _move_training_sample_to_drm(
-            pop_surrogate_con,
-            pop_surrogate_con_cons,
-            infeasible,
-            influence,
-            "max",
-            drm,
-        )
-        pop_surrogate_con, pop_surrogate_con_cons = _restore_from_drm(
-            pop_surrogate_con,
-            pop_surrogate_con_cons,
-            drm,
-            feasible=True,
-        )
+        if s_end_cons > 0 and s_end_pred <= 0:
+            # Case 4 in the paper: an infeasible solution is predicted as feasible.
+            feasible = pop_surrogate_con_cons <= 0
+            pop_surrogate_con, pop_surrogate_con_cons, drm = _move_training_sample_to_drm(
+                pop_surrogate_con,
+                pop_surrogate_con_cons,
+                feasible,
+                influence,
+                "min",
+                drm,
+            )
+            pop_surrogate_con, pop_surrogate_con_cons, drm = _restore_from_drm(
+                pop_surrogate_con,
+                pop_surrogate_con_cons,
+                drm,
+                feasible=False,
+            )
+        elif s_end_cons <= 0 and s_end_pred > 0:
+            # Case 3 in the paper: a feasible solution is predicted as infeasible.
+            infeasible = pop_surrogate_con_cons > 0
+            pop_surrogate_con, pop_surrogate_con_cons, drm = _move_training_sample_to_drm(
+                pop_surrogate_con,
+                pop_surrogate_con_cons,
+                infeasible,
+                influence,
+                "max",
+                drm,
+            )
+            pop_surrogate_con, pop_surrogate_con_cons, drm = _restore_from_drm(
+                pop_surrogate_con,
+                pop_surrogate_con_cons,
+                drm,
+                feasible=True,
+            )
 
-    feasible_s = s_cons <= 0
-    if np.sum(feasible_s) == 2 and s_fitness[1] > s_fitness[0] and pop_surrogate.shape[0] > 1:
-        remove_idx = int(np.argmax(pop_surrogate_fitness))
-        pop_surrogate = np.delete(pop_surrogate, remove_idx, axis=0)
-        pop_surrogate_fitness = np.delete(pop_surrogate_fitness, remove_idx)
+        feasible_s = s_cons <= 0
+        if np.sum(feasible_s) == 2 and s_fitness[1] > s_fitness[0] and pop_surrogate.shape[0] > 1:
+            remove_idx = int(np.argmax(pop_surrogate_fitness))
+            pop_surrogate = np.delete(pop_surrogate, remove_idx, axis=0)
+            pop_surrogate_fitness = np.delete(pop_surrogate_fitness, remove_idx)
 
-    select_set = np.vstack([pop_surrogate, pop_surrogate_con, pop])
-    selected = np.random.randint(select_set.shape[0], size=np_g)
-    pop_new = select_set[selected]
-    fitness_new, cons_new, _ = get_fitness_and_penalty(pop_new, evals)
-    state.nfes += pop_new.shape[0]
+    pop_surrogate, pop_surrogate_fitness = _append_training_samples(pop_surrogate, pop_surrogate_fitness, s, s_fitness)
+    pop_surrogate_con, pop_surrogate_con_cons = _append_training_samples(pop_surrogate_con, pop_surrogate_con_cons, s, s_cons)
+    pop_new, fitness_new, cons_new = environmental_select(pop, fitness, cons, s, s_fitness, s_cons, np_g)
 
     return pop_surrogate, pop_surrogate_fitness, pop_surrogate_con, pop_surrogate_con_cons, pop_new, fitness_new, cons_new, drm
 
@@ -439,6 +489,7 @@ def run(
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
             reporter = ProgressReporter("DSI-C2oDE", evals, repeat_index, repeat_num, progress_interval, progress_label)
             np_g, _ = population_size(evals, pop_dim, dsi=True)
+            np_g = max(1, min(np_g, state.nfes_max))
             state.np_g = np_g
 
             pop = load_initial_population(
@@ -455,55 +506,58 @@ def run(
             pop_surrogate_con_cons = cons.copy()
             db = np.column_stack([pop, fitness, cons])
             drm = np.empty((0, pop_dim + 1))
-            process = process_best_record(process, pop, fitness, cons, state.nfes, evals)
-            current_best, current_fearate = best_and_fearate(pop, fitness, cons, evals)
+            process = process_db_best_record(process, db, state.nfes)
+            current_best, _ = evaluated_best_and_fearate(db)
+            _, current_fearate = best_and_fearate(pop, fitness, cons, evals)
             reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
-            w = 40
+            w = 10
             w_max = 80
             w_min = 5
             iteration_index = 0
-            while state.nfes <= state.nfes_max:
+            while state.nfes < state.nfes_max:
                 iteration_index += 1
                 surrogate = SurrogateModel(pop_surrogate, pop_surrogate_fitness)
                 surrogate_con = SurrogateModel(pop_surrogate_con, pop_surrogate_con_cons, zero_when_all_y_zero=True)
                 pop_end, pop_mid = c2ode(pop, w, surrogate, np_g, fitness.copy(), cons.copy(), pop_max, pop_min, evals, surrogate_con, state)
                 s = adaptive_infill_sampling(pop_mid, pop_end, db, surrogate, surrogate_con)
+                remaining = state.nfes_max - state.nfes
+                if s.shape[0] > remaining:
+                    s = s[-remaining:]
                 s_fitness, s_cons, _ = get_fitness_and_penalty(s, evals)
                 state.nfes += s.shape[0]
                 db = np.vstack([db, np.column_stack([s, s_fitness, s_cons])])
 
                 if s.shape[0] == 2:
                     w = search_intensity_adjustment(s_fitness, s_cons, w, w_max, w_min)
-                    (
-                        pop_surrogate,
-                        pop_surrogate_fitness,
-                        pop_surrogate_con,
-                        pop_surrogate_con_cons,
-                        pop,
-                        fitness,
-                        cons,
-                        drm,
-                    ) = data_selection(
-                        s,
-                        s_fitness,
-                        s_cons,
-                        surrogate,
-                        surrogate_con,
-                        pop_surrogate,
-                        pop_surrogate_fitness,
-                        pop_surrogate_con,
-                        pop_surrogate_con_cons,
-                        pop,
-                        fitness,
-                        cons,
-                        drm,
-                        np_g,
-                        evals,
-                        state,
-                    )
-                process = process_best_record(process, pop, fitness, cons, state.nfes, evals)
-                current_best, current_fearate = best_and_fearate(pop, fitness, cons, evals)
+                (
+                    pop_surrogate,
+                    pop_surrogate_fitness,
+                    pop_surrogate_con,
+                    pop_surrogate_con_cons,
+                    pop,
+                    fitness,
+                    cons,
+                    drm,
+                ) = data_selection(
+                    s,
+                    s_fitness,
+                    s_cons,
+                    surrogate,
+                    surrogate_con,
+                    pop_surrogate,
+                    pop_surrogate_fitness,
+                    pop_surrogate_con,
+                    pop_surrogate_con_cons,
+                    pop,
+                    fitness,
+                    cons,
+                    drm,
+                    np_g,
+                )
+                process = process_db_best_record(process, db, state.nfes)
+                current_best, _ = evaluated_best_and_fearate(db)
+                _, current_fearate = best_and_fearate(pop, fitness, cons, evals)
                 reporter.maybe(
                     state,
                     best=current_best,
@@ -511,7 +565,8 @@ def run(
                     extra={"iter": iteration_index, "np": state.np_g},
                 )
 
-            best, fearate = best_and_fearate(pop, fitness, cons, evals)
+            best, _ = evaluated_best_and_fearate(db)
+            _, fearate = best_and_fearate(pop, fitness, cons, evals)
             reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
             best_values.append(best)
             fearates.append(fearate)

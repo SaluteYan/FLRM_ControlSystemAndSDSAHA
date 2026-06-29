@@ -118,8 +118,8 @@ def generate_problem21_mode_init_data(
 ) -> Path:
     mode = normalize_trajectory_damping_mode(damping_mode)
     specs = problem21_mode_specs(target_angle)
-    pop_max, pop_min, pop_dim, default_rows = specs[mode]
-    output_rows = rows if rows is not None else default_rows
+    pop_max, pop_min, pop_dim, _ = specs[mode]
+    output_rows = rows if rows is not None else specs["adaptive"][-1]
     master_rows = max(output_rows, max(spec[-1] for spec in specs.values()))
     master_max, master_min, _, _ = specs["adaptive"]
     master_pop = generate_population(master_min, master_max, master_rows, 21)
@@ -135,7 +135,7 @@ def generate_problem21_all_damping_init_data(
 ) -> list[Path]:
     specs = problem21_mode_specs(target_angle)
     output_rows_by_mode = {
-        mode: rows if rows is not None else specs[mode][-1]
+        mode: rows if rows is not None else specs["adaptive"][-1]
         for mode in PROBLEM21_DAMPING_MODES
     }
     master_rows = max(max(output_rows_by_mode.values()), max(spec[-1] for spec in specs.values()))

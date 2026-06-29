@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Iterable
@@ -33,6 +33,7 @@ class RunResult:
     fearate: float
     elapsed_time: float
     process: np.ndarray
+    diagnostics: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -371,7 +372,7 @@ def iteration_setting(evals: int, pop_dim: int) -> int:
 
 def population_size(evals: int, pop_dim: int, dsi: bool = False) -> tuple[int, int | None]:
     if dsi:
-        return (18 if evals not in (20, 21) else 10), None
+        return 30, None
     if evals not in (20, 21):
         return 18 * pop_dim, 18
     return 10 * pop_dim, 10

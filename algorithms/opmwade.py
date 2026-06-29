@@ -90,7 +90,8 @@ def mutation_results(
     if class_labels[i] == 1:
         r1, r2 = _unique_indices(2, np_g)
         pop_p2 = pop[np.random.choice(p2_indices)] if p2_indices.size else pop[i]
-        v = pop[i] + f * (pop[r1] - pop_best) + ftar * (pop[r2] - pop_p2)
+        # v = pop[i] + f * (pop[r1] - pop_best) + ftar * (pop[r2] - pop_p2)
+        v = pop[i] + f * (pop_best - pop[i]) + ftar * (pop[r2] - pop_p2)
     elif class_labels[i] == 2:
         r1 = np.random.randint(np_g)
         pop_p1 = pop[np.random.choice(p1_indices)] if p1_indices.size else pop[i]
@@ -130,7 +131,8 @@ def greedy_choose(
     accepted = epsilon_better(u_fitness, u_penalty, person_fitness, person_penalty, eps)
 
     if accepted:
-        return u, float(u_fitness), float(u_penalty), cr, f, float(person_fitness - u_fitness)
+        delta_f = max(float(person_fitness - u_fitness), 0.0)
+        return u, float(u_fitness), float(u_penalty), cr, f, delta_f
     return person, float(person_fitness), float(person_penalty), -1.0, -1.0, -1.0
 
 
@@ -225,8 +227,19 @@ def update_pop_pbest(
 
 
 def _weighted_lehmer(values: np.ndarray, delta_f: np.ndarray) -> float:
-    denom = np.sum(delta_f + 1e-8)
-    weights = delta_f / denom if denom != 0 else np.ones_like(delta_f) / max(delta_f.size, 1)
+    values = np.asarray(values, dtype=float)
+    positive_delta = np.maximum(np.asarray(delta_f, dtype=float), 0.0)
+    valid = np.isfinite(values) & np.isfinite(positive_delta)
+    values = values[valid]
+    positive_delta = positive_delta[valid]
+    if values.size == 0:
+        return 0.0
+
+    denom = float(np.sum(positive_delta))
+    if denom > 0:
+        weights = positive_delta / denom
+    else:
+        weights = np.ones_like(positive_delta) / positive_delta.size
     return float(np.sum(weights * values**2) / (np.sum(weights * values) + 1e-8))
 
 
@@ -297,9 +310,6 @@ def num_pop_update(
         new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + ef_mean) + np_min)
     elif num_method == 6:
         new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + np.exp(-ef_mean)) + np_min)
-    elif num_method == 7:
-        distance_sum = np.sum(np.sum((pop - pop_best) ** 2, axis=1))
-        new_np = round((np_min - np_max) * progress ** (1 + np.exp(-distance_sum)) + np_max)
     else:
         raise ValueError(f"Unsupported population update method: {num_method}")
 
@@ -334,6 +344,11 @@ def num_pop_update(
     return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty
 
 
+def append_population_size_record(process: np.ndarray, state: EvalState) -> np.ndarray:
+    row = np.array([[float(state.np_g), float(state.nfes)]])
+    return row if process.size == 0 else np.vstack([process, row])
+
+
 def run(
     evals_range: Iterable[int] = (21,),
     repeat_num: int = 1,
@@ -357,6 +372,7 @@ def run(
         times: list[float] = []
         fearates: list[float] = []
         process = np.empty((0, 2))
+        population_size_process = np.empty((0, 2))
 
         for repeat_index in range(1, repeat_num + 1):
             start = timed()
@@ -366,7 +382,7 @@ def run(
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
             reporter = ProgressReporter("OPMWADE", evals, repeat_index, repeat_num, progress_interval, progress_label)
             np_init = 10 * pop_dim if evals == 21 else 18 * pop_dim
-            np_min = 10
+            np_min = 2 * pop_dim
             np_max = np_init
             state.np_g = np_init
 
@@ -395,6 +411,7 @@ def run(
             pop_best_fitness = float(fitness[0])
             pop_worst_fitness = float(fitness[-1])
             process = process_best_record(process, pop, fitness, penalty, state.nfes, evals, variant="opmwade")
+            population_size_process = append_population_size_record(population_size_process, state)
             current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
             reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
@@ -467,6 +484,7 @@ def run(
                     pbest_fitness,
                     pbest_penalty,
                 )
+                population_size_process = append_population_size_record(population_size_process, state)
                 if state.nfes + state.np_g <= state.nfes_max:
                     pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
                         pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
@@ -486,12 +504,23 @@ def run(
             times.append(timed() - start)
 
         summary = summarize(best_values, fearates, times)
-        result = RunResult("OPMWADE", evals, *summary, process=process)
+        result = RunResult(
+            "OPMWADE",
+            evals,
+            *summary,
+            process=process,
+            diagnostics={"population_size_and_nfes": population_size_process},
+        )
         results.append(result)
         if save:
             row = np.zeros((21, 8))
             row[evals - 1, :] = np.array([evals, *summary])
-            save_mat(WORKSPACE_ROOT / "results" / "opmwade" / f"OPMWADE-P{evals}.mat", everyevalBestMediMeanWorstStdFearateTime=row, testProcessBestFitAndNfes=process)
+            save_mat(
+                WORKSPACE_ROOT / "results" / "opmwade" / f"OPMWADE-P{evals}.mat",
+                everyevalBestMediMeanWorstStdFearateTime=row,
+                testProcessBestFitAndNfes=process,
+                testProcessPopulationSizeAndNfes=population_size_process,
+            )
     return results
 
 

@@ -191,6 +191,10 @@ def write_summary(rows: list[dict], output_dir: Path) -> None:
         json.dump(rows, handle, ensure_ascii=False, indent=2)
 
 
+def result_process_arrays(result: RunResult) -> dict[str, object]:
+    return {"process": result.process, **result.diagnostics}
+
+
 def unique_experiments(experiments: list[Experiment]) -> list[tuple[ExperimentKey, int, Experiment]]:
     seen: set[ExperimentKey] = set()
     unique: list[tuple[ExperimentKey, int, Experiment]] = []
@@ -240,7 +244,7 @@ def save_rows_from_cache(
         init_file = init_file_for_target(experiment.target_angle, init_data_root, experiment.damping_mode)
         for result in result_cache[key]:
             process_file = process_dir / f"{experiment.name}.npz"
-            save_npz(process_file, process=result.process)
+            save_npz(process_file, **result_process_arrays(result))
             rows.append(result_row(experiment, result, init_file, process_file))
     write_summary(rows, output_dir)
     return rows
@@ -320,7 +324,7 @@ def run_serial_experiments(
             first_completed_name[key] = experiment.name
         for result in results:
             process_file = process_dir / f"{experiment.name}.npz"
-            save_npz(process_file, process=result.process)
+            save_npz(process_file, **result_process_arrays(result))
             rows.append(result_row(experiment, result, init_file, process_file))
             print(
                 f"    best={result.best:.10g}, mean={result.mean:.10g}, "
