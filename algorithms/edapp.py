@@ -246,7 +246,7 @@ def seeding(
     state: EvalState,
     init_data_dir: str | None = None,
     init_file: str | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     retry = False
     pop = load_initial_population(
         evals,
@@ -284,7 +284,7 @@ def seeding(
             break
         if state.nfes % 100 == 0:
             retry = True
-    return pop, penalty
+    return pop, fitness, penalty
 
 
 def run(
@@ -326,7 +326,7 @@ def run(
             alpha = 0.01
             n_delta = 10
 
-            pop, _ = seeding(
+            pop, fitness, penalty = seeding(
                 evals,
                 pop_max,
                 pop_min,
@@ -339,7 +339,6 @@ def run(
                 init_data_dir=init_data_dir or PYTHON_INIT_DIR,
                 init_file=init_file,
             )
-            fitness, penalty, _ = get_fitness_and_penalty(pop, evals, state=state, count=True)
             pop_gbest: np.ndarray | None = None
             pop_gbest_fitness: float | None = None
             pop_gbest, pop_gbest_fitness = update_gbest(pop, fitness, penalty, pop_gbest, pop_gbest_fitness, evals)

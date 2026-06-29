@@ -210,6 +210,46 @@ def get_problem21_tip_mass() -> float:
     return PROBLEM21_TIP_MASS
 
 
+def adaptive_damping_value(
+    c_d: np.ndarray | float,
+    g_min: np.ndarray | float,
+    g_max: np.ndarray | float,
+    eta_e: np.ndarray | float,
+    error: np.ndarray | float,
+) -> np.ndarray | float:
+    error2 = np.asarray(error, dtype=float) ** 2
+    eta2 = np.asarray(eta_e, dtype=float) ** 2
+    ratio = error2 / (error2 + eta2)
+    value = np.asarray(c_d, dtype=float) * (np.asarray(g_min, dtype=float) + (np.asarray(g_max, dtype=float) - np.asarray(g_min, dtype=float)) * ratio)
+    return flatten_if_single(value)
+
+
+def fixed_damping_param_bounds(error_scale: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    error = abs(get_problem21_target_angle() if error_scale is None else float(error_scale))
+    lambda_min = LEAKY_DAMPING_PARAM_MIN[0]
+    lambda_max = LEAKY_DAMPING_PARAM_MAX[0]
+    d_min = adaptive_damping_value(
+        LEAKY_DAMPING_PARAM_MIN[1],
+        LEAKY_DAMPING_PARAM_MIN[2],
+        LEAKY_DAMPING_PARAM_MIN[3],
+        LEAKY_DAMPING_PARAM_MAX[4],
+        error,
+    )
+    d_max = adaptive_damping_value(
+        LEAKY_DAMPING_PARAM_MAX[1],
+        LEAKY_DAMPING_PARAM_MAX[2],
+        LEAKY_DAMPING_PARAM_MAX[3],
+        LEAKY_DAMPING_PARAM_MIN[4],
+        error,
+    )
+    return np.array([lambda_min, float(d_min)], dtype=float), np.array([lambda_max, float(d_max)], dtype=float)
+
+
+def default_fixed_damping_params(error_scale: float | None = None) -> np.ndarray:
+    fixed_min, fixed_max = fixed_damping_param_bounds(error_scale)
+    return 0.5 * (fixed_min + fixed_max)
+
+
 def target_angle_label(target_angle: float) -> str:
     text = f"{float(target_angle):.12g}"
     return text.replace("-", "neg_").replace(".", "_")
@@ -355,8 +395,9 @@ def set_initial_scope(evals: int) -> tuple[np.ndarray, np.ndarray, int]:
         max_v = np.concatenate([curve_max, h_max, zv_max])
         damping_mode = get_trajectory_damping_mode()
         if damping_mode == "fixed":
-            min_v = np.concatenate([min_v, FIXED_DAMPING_PARAM_MIN])
-            max_v = np.concatenate([max_v, FIXED_DAMPING_PARAM_MAX])
+            fixed_min, fixed_max = fixed_damping_param_bounds(sitab)
+            min_v = np.concatenate([min_v, fixed_min])
+            max_v = np.concatenate([max_v, fixed_max])
         elif damping_mode == "adaptive":
             min_v = np.concatenate([min_v, LEAKY_DAMPING_PARAM_MIN])
             max_v = np.concatenate([max_v, LEAKY_DAMPING_PARAM_MAX])
@@ -367,7 +408,7 @@ def set_initial_scope(evals: int) -> tuple[np.ndarray, np.ndarray, int]:
 
 
 def iteration_setting(evals: int, pop_dim: int) -> int:
-    return 360 * pop_dim if evals not in (20, 21) else 3000
+    return 360 * pop_dim if evals not in (20, 21) else 6400
 
 
 def population_size(evals: int, pop_dim: int, dsi: bool = False) -> tuple[int, int | None]:
@@ -469,8 +510,7 @@ def load_initial_population(
         pop = generate_population(pop_min, pop_max, default_n, evals)
 
     if n is not None and n < pop.shape[0]:
-        rows = np.random.choice(pop.shape[0], size=int(n), replace=False)
-        pop = pop[rows, :]
+        pop = pop[: int(n), :]
     elif n is not None and n > pop.shape[0]:
         pop_max, pop_min, _ = set_initial_scope(evals)
         extra = generate_population(pop_min, pop_max, int(n) - pop.shape[0], evals)
@@ -947,7 +987,7 @@ def fixed_damping_params_from_vector(x: np.ndarray) -> tuple[float, float]:
     if x.size >= 13:
         params = np.asarray(x[11:13], dtype=float)
     else:
-        params = DEFAULT_FIXED_DAMPING_PARAMS.copy()
+        params = default_fixed_damping_params()
     return tuple(float(value) for value in params)
 
 
@@ -1038,7 +1078,7 @@ def integrate_model(
     phi_a = optimizing_zv(sita_real, a1, a2, t2)
     dphi_a, ddphi_a = trajectory_derivatives(phi_a, step)
     if fixed_damping_params is None:
-        fixed_damping_params = tuple(float(value) for value in DEFAULT_FIXED_DAMPING_PARAMS)
+        fixed_damping_params = tuple(float(value) for value in default_fixed_damping_params(sitab))
     lambda_f, d_f = fixed_damping_params
     if leaky_damping_params is None:
         leaky_damping_params = tuple(float(value) for value in DEFAULT_LEAKY_DAMPING_PARAMS)

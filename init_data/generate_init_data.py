@@ -14,6 +14,7 @@ if str(CONVERTED_ROOT) not in sys.path:
 from algorithms.common import (
     DEFAULT_INIT_DATA_ROOT,
     DEFAULT_PROBLEM21_TARGET_ANGLE,
+    adaptive_damping_value,
     get_problem21_target_angle,
     get_trajectory_damping_mode,
     generate_population,
@@ -108,6 +109,31 @@ def save_problem21_init_data(
     return output_path
 
 
+def problem21_population_from_adaptive_master(
+    master_pop: np.ndarray,
+    damping_mode: str,
+    pop_min: np.ndarray,
+    pop_max: np.ndarray,
+    pop_dim: int,
+    rows: int,
+    fixed_damping_error_scale: float | None = None,
+) -> np.ndarray:
+    mode = normalize_trajectory_damping_mode(damping_mode)
+    master = np.asarray(master_pop, dtype=float)[:rows]
+    if mode == "fixed":
+        lambda_f = master[:, 11]
+        c_d = master[:, 12]
+        g_min = master[:, 13]
+        g_max = master[:, 14]
+        eta_e = master[:, 15]
+        error_scale = get_problem21_target_angle() if fixed_damping_error_scale is None else fixed_damping_error_scale
+        d_f = adaptive_damping_value(c_d, g_min, g_max, eta_e, error_scale)
+        pop = np.column_stack([master[:, :11], lambda_f, d_f])
+    else:
+        pop = master[:, :pop_dim]
+    return np.minimum(np.maximum(pop, pop_min), pop_max)
+
+
 def generate_problem21_mode_init_data(
     output_dir: Path,
     target_angle: float,
@@ -123,7 +149,15 @@ def generate_problem21_mode_init_data(
     master_rows = max(output_rows, max(spec[-1] for spec in specs.values()))
     master_max, master_min, _, _ = specs["adaptive"]
     master_pop = generate_population(master_min, master_max, master_rows, 21)
-    pop = master_pop[:output_rows, :pop_dim]
+    pop = problem21_population_from_adaptive_master(
+        master_pop,
+        mode,
+        pop_min,
+        pop_max,
+        pop_dim,
+        output_rows,
+        fixed_damping_error_scale=target_angle,
+    )
     output_path = problem21_output_path(output_dir, target_angle, mode, target_angle_was_explicit, output_file)
     return save_problem21_init_data(output_path, pop, pop_min, pop_max, pop_dim, target_angle, mode)
 
@@ -146,7 +180,15 @@ def generate_problem21_all_damping_init_data(
     for mode in PROBLEM21_DAMPING_MODES:
         pop_max, pop_min, pop_dim, _ = specs[mode]
         output_rows = output_rows_by_mode[mode]
-        pop = master_pop[:output_rows, :pop_dim]
+        pop = problem21_population_from_adaptive_master(
+            master_pop,
+            mode,
+            pop_min,
+            pop_max,
+            pop_dim,
+            output_rows,
+            fixed_damping_error_scale=target_angle,
+        )
         output_path = output_dir / target_angle_init_data_filename(21, target_angle, mode)
         paths.append(save_problem21_init_data(output_path, pop, pop_min, pop_max, pop_dim, target_angle, mode))
     return paths

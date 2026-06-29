@@ -488,7 +488,10 @@ def run(
             pop_max, pop_min, pop_dim = set_initial_scope(evals)
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
             reporter = ProgressReporter("DSI-C2oDE", evals, repeat_index, repeat_num, progress_interval, progress_label)
-            np_g, _ = population_size(evals, pop_dim, dsi=True)
+            if evals == 21:
+                np_g, _ = population_size(evals, pop_dim)
+            else:
+                np_g, _ = population_size(evals, pop_dim, dsi=True)
             np_g = max(1, min(np_g, state.nfes_max))
             state.np_g = np_g
 
