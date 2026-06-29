@@ -5,6 +5,7 @@ import numpy as np
 from .common import (
     DEFAULT_PROBLEM21_TIP_MASS,
     EvalState,
+    ProgressReporter,
     RunResult,
     WORKSPACE_ROOT,
     best_and_fearate,
@@ -344,6 +345,8 @@ def run(
     init_data_dir: str | None = None,
     init_file: str | None = None,
     tip_mass: float | None = None,
+    progress_interval: int = 0,
+    progress_label: str | None = None,
 ) -> list[RunResult]:
     if seed is not None:
         np.random.seed(seed)
@@ -355,12 +358,13 @@ def run(
         fearates: list[float] = []
         process = np.empty((0, 2))
 
-        for _ in range(repeat_num):
+        for repeat_index in range(1, repeat_num + 1):
             start = timed()
             set_problem21_tip_mass(DEFAULT_PROBLEM21_TIP_MASS if tip_mass is None else tip_mass)
             configure_problem_from_init_data(evals, init_data_dir=init_data_dir or PYTHON_INIT_DIR, init_file=init_file)
             pop_max, pop_min, pop_dim = set_initial_scope(evals)
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
+            reporter = ProgressReporter("OPMWADE", evals, repeat_index, repeat_num, progress_interval, progress_label)
             np_init = 10 * pop_dim if evals == 21 else 18 * pop_dim
             np_min = 10
             np_max = np_init
@@ -391,13 +395,17 @@ def run(
             pop_best_fitness = float(fitness[0])
             pop_worst_fitness = float(fitness[-1])
             process = process_best_record(process, pop, fitness, penalty, state.nfes, evals, variant="opmwade")
+            current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
+            reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
             memory_len = 5
             mcr = 0.5 * np.ones(memory_len)
             mf = 0.5 * np.ones(memory_len)
             memory_index = 0
+            iteration_index = 0
 
             while state.nfes <= state.nfes_max:
+                iteration_index += 1
                 scr = np.zeros(state.np_g)
                 sf = np.zeros(state.np_g)
                 delta_f = np.zeros(state.np_g)
@@ -463,8 +471,16 @@ def run(
                     pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
                         pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
                     )
+                current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
+                reporter.maybe(
+                    state,
+                    best=current_best,
+                    fearate=current_fearate,
+                    extra={"iter": iteration_index, "np": state.np_g},
+                )
 
             best, fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
+            reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)

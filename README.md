@@ -30,6 +30,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+With the existing conda environment on this machine:
+
+```bash
+conda run -n algorithm_py_env python -m pip install -r requirements.txt
+```
+
 ## Run One Algorithm
 
 Run OPMWADE on Problem 21 with adaptive damping, target angle 1.05 rad, and tip mass 9.78 g:
@@ -63,6 +69,22 @@ Run the full requested experiment batch:
 ```bash
 python run_requested_experiments.py
 ```
+
+Run the full requested experiment batch in `algorithm_py_env` using multiple CPU processes:
+
+```bash
+conda run --no-capture-output -n algorithm_py_env python run_requested_experiments.py --workers 0
+```
+
+`--workers 0` uses one process per unique optimization run, capped by CPU count. To avoid oversubscribing BLAS/OpenMP threads inside each process, parallel runs set common inner thread environment variables to `1` by default; use `--inner-threads 0` to keep the current environment unchanged, or choose an explicit per-worker value.
+
+Progress is printed every 500 function evaluations by default. Adjust it with `--progress-interval`, or disable it with `--progress-interval 0`:
+
+```bash
+conda run --no-capture-output -n algorithm_py_env python run_requested_experiments.py --workers 0 --progress-interval 1000
+```
+
+`--max-nfes` limits real objective evaluations. For RND this includes the hidden finite-difference objective calls used for numerical gradients and Hessian terms.
 
 The script writes:
 

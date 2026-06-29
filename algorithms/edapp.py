@@ -8,6 +8,7 @@ from sklearn.cluster import KMeans
 from .common import (
     DEFAULT_PROBLEM21_TIP_MASS,
     EvalState,
+    ProgressReporter,
     RunResult,
     WORKSPACE_ROOT,
     best_and_fearate,
@@ -296,6 +297,8 @@ def run(
     init_data_dir: str | None = None,
     init_file: str | None = None,
     tip_mass: float | None = None,
+    progress_interval: int = 0,
+    progress_label: str | None = None,
 ) -> list[RunResult]:
     if seed is not None:
         np.random.seed(seed)
@@ -307,12 +310,13 @@ def run(
         times: list[float] = []
         process = np.empty((0, 2))
 
-        for _ in range(repeat_num):
+        for repeat_index in range(1, repeat_num + 1):
             start = timed()
             set_problem21_tip_mass(DEFAULT_PROBLEM21_TIP_MASS if tip_mass is None else tip_mass)
             configure_problem_from_init_data(evals, init_data_dir=init_data_dir or PYTHON_INIT_DIR, init_file=init_file)
             pop_max, pop_min, pop_dim = set_initial_scope(evals)
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
+            reporter = ProgressReporter("EDA++", evals, repeat_index, repeat_num, progress_interval, progress_label)
             np_g, np_base = population_size(evals, pop_dim)
             state.np_g = np_g
 
@@ -341,8 +345,14 @@ def run(
             pop_gbest, pop_gbest_fitness = update_gbest(pop, fitness, penalty, pop_gbest, pop_gbest_fitness, evals)
             if pop_gbest_fitness is not None:
                 process = np.vstack([process, [pop_gbest_fitness, state.nfes]])
+            current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals)
+            if pop_gbest_fitness is not None:
+                current_best = pop_gbest_fitness
+            reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
+            iteration_index = 0
             while state.nfes <= state.nfes_max:
+                iteration_index += 1
                 pop_selected, _, fitness_selected = selection(pop, gama, fitness)
                 phi_big, phi = learning(pop_selected, fitness_selected, alpha, lamda, evals, state)
                 pop_sampled = sampling(phi_big, phi, np_g)
@@ -353,10 +363,20 @@ def run(
                 pop_gbest, pop_gbest_fitness = update_gbest(pop, fitness, penalty, pop_gbest, pop_gbest_fitness, evals)
                 if pop_gbest_fitness is not None:
                     process = np.vstack([process, [pop_gbest_fitness, state.nfes]])
+                current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals)
+                if pop_gbest_fitness is not None:
+                    current_best = pop_gbest_fitness
+                reporter.maybe(
+                    state,
+                    best=current_best,
+                    fearate=current_fearate,
+                    extra={"iter": iteration_index, "np": state.np_g},
+                )
 
             best, fearate = best_and_fearate(pop, fitness, penalty, evals)
             if pop_gbest_fitness is not None:
                 best = pop_gbest_fitness
+            reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)

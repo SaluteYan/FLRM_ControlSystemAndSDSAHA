@@ -7,6 +7,7 @@ import numpy as np
 from .common import (
     DEFAULT_PROBLEM21_TIP_MASS,
     EvalState,
+    ProgressReporter,
     RunResult,
     WORKSPACE_ROOT,
     best_and_fearate,
@@ -417,6 +418,8 @@ def run(
     init_data_dir: str | None = None,
     init_file: str | None = None,
     tip_mass: float | None = None,
+    progress_interval: int = 0,
+    progress_label: str | None = None,
 ) -> list[RunResult]:
     if seed is not None:
         np.random.seed(seed)
@@ -428,12 +431,13 @@ def run(
         times: list[float] = []
         process = np.empty((0, 2))
 
-        for _ in range(repeat_num):
+        for repeat_index in range(1, repeat_num + 1):
             start = timed()
             set_problem21_tip_mass(DEFAULT_PROBLEM21_TIP_MASS if tip_mass is None else tip_mass)
             configure_problem_from_init_data(evals, init_data_dir=init_data_dir or PYTHON_INIT_DIR, init_file=init_file)
             pop_max, pop_min, pop_dim = set_initial_scope(evals)
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
+            reporter = ProgressReporter("DSI-C2oDE", evals, repeat_index, repeat_num, progress_interval, progress_label)
             np_g, _ = population_size(evals, pop_dim, dsi=True)
             state.np_g = np_g
 
@@ -452,11 +456,15 @@ def run(
             db = np.column_stack([pop, fitness, cons])
             drm = np.empty((0, pop_dim + 1))
             process = process_best_record(process, pop, fitness, cons, state.nfes, evals)
+            current_best, current_fearate = best_and_fearate(pop, fitness, cons, evals)
+            reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
             w = 40
             w_max = 80
             w_min = 5
+            iteration_index = 0
             while state.nfes <= state.nfes_max:
+                iteration_index += 1
                 surrogate = SurrogateModel(pop_surrogate, pop_surrogate_fitness)
                 surrogate_con = SurrogateModel(pop_surrogate_con, pop_surrogate_con_cons, zero_when_all_y_zero=True)
                 pop_end, pop_mid = c2ode(pop, w, surrogate, np_g, fitness.copy(), cons.copy(), pop_max, pop_min, evals, surrogate_con, state)
@@ -495,8 +503,16 @@ def run(
                         state,
                     )
                 process = process_best_record(process, pop, fitness, cons, state.nfes, evals)
+                current_best, current_fearate = best_and_fearate(pop, fitness, cons, evals)
+                reporter.maybe(
+                    state,
+                    best=current_best,
+                    fearate=current_fearate,
+                    extra={"iter": iteration_index, "np": state.np_g},
+                )
 
             best, fearate = best_and_fearate(pop, fitness, cons, evals)
+            reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -33,6 +33,114 @@ class RunResult:
     fearate: float
     elapsed_time: float
     process: np.ndarray
+
+
+@dataclass(frozen=True)
+class ProgressInfo:
+    algorithm: str
+    evals: int
+    repeat_index: int
+    repeat_num: int
+    nfes: int
+    nfes_max: int
+    elapsed_time: float
+    best: float | None = None
+    fearate: float | None = None
+    label: str | None = None
+    extra: dict[str, int | float | str] | None = None
+
+
+ProgressCallback = Callable[[ProgressInfo], None]
+
+
+def _format_progress_value(value: float | None) -> str:
+    if value is None:
+        return "NA"
+    if np.isfinite(value):
+        return f"{value:.10g}"
+    return str(value)
+
+
+def print_progress(info: ProgressInfo) -> None:
+    progress_pct = 100.0 * min(info.nfes, info.nfes_max) / max(info.nfes_max, 1)
+    head = f"[progress] {info.algorithm} P{info.evals} repeat={info.repeat_index}/{info.repeat_num}"
+    if info.label:
+        head = f"{head} | {info.label}"
+
+    parts = [
+        head,
+        f"nfes={info.nfes}/{info.nfes_max} ({progress_pct:.1f}%)",
+        f"best={_format_progress_value(info.best)}",
+    ]
+    if info.fearate is not None:
+        parts.append(f"fearate={info.fearate:.4g}")
+    if info.extra:
+        parts.extend(f"{key}={value}" for key, value in info.extra.items())
+    parts.append(f"elapsed={info.elapsed_time:.1f}s")
+    print(" | ".join(parts), flush=True)
+
+
+class ProgressReporter:
+    def __init__(
+        self,
+        algorithm: str,
+        evals: int,
+        repeat_index: int,
+        repeat_num: int,
+        interval: int = 0,
+        label: str | None = None,
+        callback: ProgressCallback | None = None,
+    ) -> None:
+        self.algorithm = algorithm
+        self.evals = evals
+        self.repeat_index = repeat_index
+        self.repeat_num = repeat_num
+        self.interval = max(0, int(interval or 0))
+        self.label = label
+        self.callback = callback or print_progress
+        self.start_time = perf_counter()
+        self.next_nfes = self.interval
+        self.last_nfes = -1
+
+    @property
+    def enabled(self) -> bool:
+        return self.interval > 0
+
+    def maybe(
+        self,
+        state: EvalState,
+        best: float | None = None,
+        fearate: float | None = None,
+        extra: dict[str, int | float | str] | None = None,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        nfes = int(state.nfes)
+        nfes_max = int(state.nfes_max)
+        if not force and nfes < self.next_nfes and nfes < nfes_max:
+            return
+        if nfes == self.last_nfes:
+            return
+        while self.next_nfes <= nfes:
+            self.next_nfes += self.interval
+        self.last_nfes = nfes
+        self.callback(
+            ProgressInfo(
+                algorithm=self.algorithm,
+                evals=self.evals,
+                repeat_index=self.repeat_index,
+                repeat_num=self.repeat_num,
+                nfes=nfes,
+                nfes_max=nfes_max,
+                elapsed_time=perf_counter() - self.start_time,
+                best=best,
+                fearate=fearate,
+                label=self.label,
+                extra=extra,
+            )
+        )
 
 
 TRAJECTORY_DAMPING_MODES = {"none", "fixed", "adaptive"}
@@ -258,7 +366,7 @@ def set_initial_scope(evals: int) -> tuple[np.ndarray, np.ndarray, int]:
 
 
 def iteration_setting(evals: int, pop_dim: int) -> int:
-    return 360 * pop_dim if evals not in (20, 21) else 600
+    return 360 * pop_dim if evals not in (20, 21) else 3000
 
 
 def population_size(evals: int, pop_dim: int, dsi: bool = False) -> tuple[int, int | None]:
