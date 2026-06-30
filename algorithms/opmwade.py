@@ -25,10 +25,81 @@ from .common import (
 
 
 PYTHON_INIT_DIR = WORKSPACE_ROOT / "init_data"
+ADAPTIVE_NP_METHOD = 7
+ADAPTIVE_NP_LOOKBACK = 5
+ADAPTIVE_NP_IMPROVE_TARGET = 1e-3
+ADAPTIVE_NP_STAGNATION = 1e-4
+ADAPTIVE_NP_DIVERSITY_TARGET = 0.1
+ADAPTIVE_NP_SIGMOID_GAIN = 3.0
+ADAPTIVE_NP_EXPLORE_BOOST = 0.3
+ADAPTIVE_NP_COLLAPSE_BOOST = 0.1
+ADAPTIVE_NP_SLOW_SHRINK_RATIO = 0.95
+ADAPTIVE_NP_MIN_SLOW_SHRINK_RATIO = 0.6
+CONSTRAINT_AWARE_FTAR_METHOD = 4
+FTAR_MIN = 0.25
+FTAR_MAX = 0.75
+FTAR_INFEASIBLE_BOOST = 0.25
+SUCCESS_OBJECTIVE_WEIGHT = 1.0
+SUCCESS_PENALTY_WEIGHT = 0.25
 
 
 def _cauchy(mu: float, gamma: float) -> float:
     return float(mu + gamma * np.tan(np.pi * (np.random.rand() - 0.5)))
+
+
+def _weighted_arithmetic(values: np.ndarray, delta_f: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    positive_delta = np.maximum(np.asarray(delta_f, dtype=float), 0.0)
+    valid = np.isfinite(values) & np.isfinite(positive_delta)
+    values = values[valid]
+    positive_delta = positive_delta[valid]
+    if values.size == 0:
+        return 0.0
+
+    denom = float(np.sum(positive_delta))
+    if denom > 0:
+        weights = positive_delta / denom
+    else:
+        weights = np.ones_like(positive_delta) / positive_delta.size
+    return float(np.sum(weights * values))
+
+
+def _robust_merit_ita(merit: np.ndarray) -> float:
+    merit = np.asarray(merit, dtype=float)
+    merit = merit[np.isfinite(merit)]
+    if merit.size <= 1:
+        return 0.0
+
+    low, high = np.percentile(merit, [10, 90])
+    spread = float(high - low)
+    if abs(spread) <= 1e-12:
+        return 0.0
+    normalized = np.clip((merit - low) / (spread + 1e-12), 0.0, 1.0)
+    return float(np.mean(normalized))
+
+
+def constraint_aware_ftar(pop_fitness: np.ndarray, pop_penalty: np.ndarray, eps: float) -> float:
+    fitness = np.asarray(pop_fitness, dtype=float).reshape(-1)
+    penalty = np.asarray(pop_penalty, dtype=float).reshape(-1)
+    finite = np.isfinite(fitness) & np.isfinite(penalty)
+    fitness = fitness[finite]
+    penalty = penalty[finite]
+    if fitness.size == 0:
+        return FTAR_MAX
+
+    penalty_excess = np.maximum(penalty - eps, 0.0)
+    fit_q25, fit_q75 = np.percentile(fitness, [25, 75])
+    pen_q25, pen_q75 = np.percentile(penalty_excess, [25, 75])
+    fit_scale = abs(float(fit_q75 - fit_q25))
+    pen_scale = abs(float(pen_q75 - pen_q25))
+    penalty_coeff = fit_scale / (pen_scale + 1e-8) if pen_scale > 0 else 1.0
+
+    merit = fitness + penalty_coeff * penalty_excess
+    ita = _robust_merit_ita(merit)
+    feasible_rate = float(np.mean(penalty <= eps))
+    ftar = 1.0 - np.sin(ita * np.pi / 2)
+    ftar += FTAR_INFEASIBLE_BOOST * (1.0 - feasible_rate)
+    return float(np.clip(ftar, FTAR_MIN, FTAR_MAX))
 
 
 def mutation_and_crossover_params(
@@ -36,6 +107,8 @@ def mutation_and_crossover_params(
     mcr: np.ndarray,
     mf: np.ndarray,
     pop_fitness: np.ndarray,
+    pop_penalty: np.ndarray,
+    eps: float,
     ftar_method: int,
     state: EvalState,
 ) -> tuple[float, float, float]:
@@ -61,14 +134,22 @@ def mutation_and_crossover_params(
         worst = np.max(pop_fitness)
         ita = np.sum((pop_fitness - best) / (worst - best + 1e-8)) / pop_fitness.size
         ftar = float(1 - np.sin(ita * np.pi / 2))
+    elif ftar_method == CONSTRAINT_AWARE_FTAR_METHOD:
+        ftar = constraint_aware_ftar(pop_fitness, pop_penalty, eps)
     else:
         raise ValueError(f"Unsupported Ftar method: {ftar_method}")
     return f, ftar, cr
 
 
-def _unique_indices(count: int, upper: int) -> np.ndarray:
-    replace = upper < count
-    return np.random.choice(upper, size=count, replace=replace)
+def _unique_indices(count: int, upper: int, exclude: int | None = None) -> np.ndarray:
+    if exclude is None:
+        candidates = np.arange(upper)
+    else:
+        candidates = np.array([idx for idx in range(upper) if idx != exclude], dtype=int)
+    if candidates.size == 0:
+        candidates = np.arange(upper)
+    replace = candidates.size < count
+    return np.random.choice(candidates, size=count, replace=replace)
 
 
 def mutation_results(
@@ -88,16 +169,16 @@ def mutation_results(
     p2_indices = np.flatnonzero(class_labels == 2)
 
     if class_labels[i] == 1:
-        r1, r2 = _unique_indices(2, np_g)
+        r1, r2 = _unique_indices(2, np_g, exclude=i)
         pop_p2 = pop[np.random.choice(p2_indices)] if p2_indices.size else pop[i]
         # v = pop[i] + f * (pop[r1] - pop_best) + ftar * (pop[r2] - pop_p2)
         v = pop[i] + f * (pop_best - pop[i]) + ftar * (pop[r2] - pop_p2)
     elif class_labels[i] == 2:
-        r1 = np.random.randint(np_g)
+        r1 = _unique_indices(1, np_g, exclude=i)[0]
         pop_p1 = pop[np.random.choice(p1_indices)] if p1_indices.size else pop[i]
         v = pop[i] + f * (pop_pbest[i] - pop[i]) + ftar * (pop[r1] - pop_p1)
     else:
-        r1, r2, r3, r4 = _unique_indices(4, np_g)
+        r1, r2, r3, r4 = _unique_indices(4, np_g, exclude=i)
         v = pop[i] + f * (pop[r1] - pop[r2]) + ftar * (pop[r3] - pop[r4])
 
     v = np.minimum(np.maximum(v, pop_min), pop_max)
@@ -131,7 +212,9 @@ def greedy_choose(
     accepted = epsilon_better(u_fitness, u_penalty, person_fitness, person_penalty, eps)
 
     if accepted:
-        delta_f = max(float(person_fitness - u_fitness), 0.0)
+        objective_gain = max(float(person_fitness - u_fitness), 0.0) / (abs(float(person_fitness)) + abs(float(u_fitness)) + 1e-8)
+        penalty_gain = max(float(person_penalty - u_penalty), 0.0) / (abs(float(person_penalty)) + abs(float(u_penalty)) + 1e-8)
+        delta_f = SUCCESS_OBJECTIVE_WEIGHT * objective_gain + SUCCESS_PENALTY_WEIGHT * penalty_gain
         return u, float(u_fitness), float(u_penalty), cr, f, delta_f
     return person, float(person_fitness), float(person_penalty), -1.0, -1.0, -1.0
 
@@ -257,10 +340,92 @@ def update_mcr_and_mf(
     mcr_new = mcr.copy()
     mf_new = mf.copy()
     if mcr[k] != 0 and (scr.size == 0 or np.max(scr) != 0):
-        mcr_new[k] = _weighted_lehmer(scr, delta_f)
+        mcr_new[k] = _weighted_arithmetic(scr, delta_f)
     if sf.size:
         mf_new[k] = _weighted_lehmer(sf, delta_f)
     return (k + 1) % memory_len, mcr_new, mf_new
+
+
+def _sigmoid(value: float) -> float:
+    value = float(np.clip(value, -60.0, 60.0))
+    return float(1.0 / (1.0 + np.exp(-value)))
+
+
+def _feasible_best(fitness: np.ndarray, penalty: np.ndarray) -> float:
+    feasible_fitness = np.asarray(fitness, dtype=float)[np.asarray(penalty, dtype=float) <= 0]
+    feasible_fitness = feasible_fitness[np.isfinite(feasible_fitness)]
+    if feasible_fitness.size == 0:
+        return float("inf")
+    return float(np.min(feasible_fitness))
+
+
+def _adaptive_population_size(
+    state: EvalState,
+    fitness: np.ndarray,
+    penalty: np.ndarray,
+    np_max: int,
+    np_min: int,
+    best_history: list[float] | None,
+) -> int:
+    progress = float(np.clip(state.nfes / max(state.nfes_max, 1), 0.0, 1.0))
+    feasible_fitness = np.asarray(fitness, dtype=float)[np.asarray(penalty, dtype=float) <= 0]
+    feasible_fitness = feasible_fitness[np.isfinite(feasible_fitness)]
+    best_now = float(np.min(feasible_fitness)) if feasible_fitness.size else float("inf")
+
+    if best_history:
+        lookback_index = max(0, len(best_history) - ADAPTIVE_NP_LOOKBACK)
+        best_prev = float(best_history[lookback_index])
+    else:
+        best_prev = best_now
+
+    if np.isfinite(best_prev) and np.isfinite(best_now):
+        improve_rate = max(best_prev - best_now, 0.0) / (abs(best_prev) + 1e-8)
+    else:
+        improve_rate = 0.0
+
+    if best_history is not None and np.isfinite(best_now):
+        best_history.append(best_now)
+
+    if feasible_fitness.size > 1:
+        fitness_diversity = float(np.std(feasible_fitness) / (abs(np.mean(feasible_fitness)) + 1e-8))
+    else:
+        fitness_diversity = 0.0
+
+    improvement_score = float(np.clip(improve_rate / ADAPTIVE_NP_IMPROVE_TARGET, 0.0, 1.0))
+    alpha = 1.2 + improvement_score
+    base_np = np_min + (np_max - np_min) * (1.0 - progress) ** alpha
+
+    stagnation_arg = ADAPTIVE_NP_SIGMOID_GAIN * (
+        (ADAPTIVE_NP_STAGNATION - improve_rate) / (ADAPTIVE_NP_STAGNATION + 1e-12)
+    )
+    stagnation_score = _sigmoid(stagnation_arg)
+    if feasible_fitness.size == 0:
+        diversity_score = 1.0
+    else:
+        diversity_score = float(np.clip(fitness_diversity / ADAPTIVE_NP_DIVERSITY_TARGET, 0.0, 1.0))
+
+    need_explore = float(np.clip(stagnation_score * diversity_score, 0.0, 1.0))
+    need_injection = float(np.clip(stagnation_score * (1.0 - diversity_score), 0.0, 1.0))
+    late_decay = 1.0 - progress
+    boost = (np_max - base_np) * late_decay * (
+        ADAPTIVE_NP_EXPLORE_BOOST * need_explore
+        + ADAPTIVE_NP_COLLAPSE_BOOST * need_injection
+    )
+    new_np = int(round(base_np + boost))
+
+    if stagnation_score > 0.8 and progress < 0.95:
+        slow_shrink_ratio = max(
+            ADAPTIVE_NP_MIN_SLOW_SHRINK_RATIO,
+            ADAPTIVE_NP_SLOW_SHRINK_RATIO - 0.4 * progress,
+        )
+        slow_shrink_np = int(round(slow_shrink_ratio * state.np_g))
+        if diversity_score > 0.5:
+            new_np = max(new_np, slow_shrink_np)
+        elif need_injection > 0.8:
+            injection = max(1, int(round(0.02 * np_max * late_decay)))
+            new_np = max(new_np, slow_shrink_np + injection)
+
+    return int(np.clip(new_np, np_min, np_max))
 
 
 def num_pop_update(
@@ -283,35 +448,39 @@ def num_pop_update(
     pop_pbest: np.ndarray,
     pbest_fitness: np.ndarray,
     pbest_penalty: np.ndarray,
+    best_history: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     old_np = state.np_g
-    feasible_count = int(np.sum(penalty <= 0))
-    if feasible_count == 0:
-        ef_total = abs(np.sum((penalty - penalty[0]) / (penalty[-1] - penalty[0] - 1e-8)))
-    elif feasible_count == old_np:
-        ef_total = abs(np.sum((fitness - pop_best_fitness) / (pop_worst_fitness - pop_best_fitness - 1e-8)))
-    else:
-        pop_feasi_ef = abs(np.sum((fitness[:feasible_count] - pop_best_fitness) / (fitness[feasible_count - 1] - pop_best_fitness - 1e-8)))
-        tail = penalty[feasible_count:]
-        pop_ufeasi_ef = abs(np.sum((tail - tail[0]) / (tail[-1] - tail[0] - 1e-8))) if tail.size else 0
-        ef_total = pop_feasi_ef + pop_ufeasi_ef
-
-    ef_mean = ef_total / max(old_np - 1, 1)
     progress = state.nfes / max(state.nfes_max, 1)
-    if num_method == 1:
-        new_np = round((np_max - np_min) * ef_mean ** max(state.nfes, 1) + np_min)
-    elif num_method == 2:
-        new_np = round((np_max - np_min) * np.random.rand() + np_min)
-    elif num_method == 3:
-        new_np = round((np_max - np_min) * np.random.rand() * ef_mean + np_min)
-    elif num_method == 4:
-        new_np = round((np_max - np_min) * (progress - 1) ** 2 + np_min)
-    elif num_method == 5:
-        new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + ef_mean) + np_min)
-    elif num_method == 6:
-        new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + np.exp(-ef_mean)) + np_min)
+    if num_method == ADAPTIVE_NP_METHOD:
+        new_np = _adaptive_population_size(state, fitness, penalty, np_max, np_min, best_history)
     else:
-        raise ValueError(f"Unsupported population update method: {num_method}")
+        feasible_count = int(np.sum(penalty <= 0))
+        if feasible_count == 0:
+            ef_total = abs(np.sum((penalty - penalty[0]) / (penalty[-1] - penalty[0] - 1e-8)))
+        elif feasible_count == old_np:
+            ef_total = abs(np.sum((fitness - pop_best_fitness) / (pop_worst_fitness - pop_best_fitness - 1e-8)))
+        else:
+            pop_feasi_ef = abs(np.sum((fitness[:feasible_count] - pop_best_fitness) / (fitness[feasible_count - 1] - pop_best_fitness - 1e-8)))
+            tail = penalty[feasible_count:]
+            pop_ufeasi_ef = abs(np.sum((tail - tail[0]) / (tail[-1] - tail[0] - 1e-8))) if tail.size else 0
+            ef_total = pop_feasi_ef + pop_ufeasi_ef
+
+        ef_mean = ef_total / max(old_np - 1, 1)
+        if num_method == 1:
+            new_np = round((np_max - np_min) * ef_mean ** max(state.nfes, 1) + np_min)
+        elif num_method == 2:
+            new_np = round((np_max - np_min) * np.random.rand() + np_min)
+        elif num_method == 3:
+            new_np = round((np_max - np_min) * np.random.rand() * ef_mean + np_min)
+        elif num_method == 4:
+            new_np = round((np_max - np_min) * (progress - 1) ** 2 + np_min)
+        elif num_method == 5:
+            new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + ef_mean) + np_min)
+        elif num_method == 6:
+            new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + np.exp(-ef_mean)) + np_min)
+        else:
+            raise ValueError(f"Unsupported population update method: {num_method}")
 
     state.np_g = int(np.clip(new_np, np_min, np_max))
     row = fitness.size
@@ -355,8 +524,8 @@ def run(
     seed: int | None = None,
     max_nfes: int | None = None,
     save: bool = True,
-    num_method: int = 6,
-    ftar_method: int = 3,
+    num_method: int = ADAPTIVE_NP_METHOD,
+    ftar_method: int = CONSTRAINT_AWARE_FTAR_METHOD,
     init_data_dir: str | None = None,
     init_file: str | None = None,
     tip_mass: float | None = None,
@@ -413,6 +582,8 @@ def run(
             process = process_best_record(process, pop, fitness, penalty, state.nfes, evals, variant="opmwade")
             population_size_process = append_population_size_record(population_size_process, state)
             current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
+            initial_best = _feasible_best(fitness, penalty)
+            best_fitness_history = [initial_best] if np.isfinite(initial_best) else []
             reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
             memory_len = 5
@@ -430,7 +601,7 @@ def run(
                 eps = generate_epsilon(eps0, lamta, p, state)
 
                 for i in range(state.np_g):
-                    f, ftar, cr = mutation_and_crossover_params(memory_len, mcr, mf, fitness, ftar_method, state)
+                    f, ftar, cr = mutation_and_crossover_params(memory_len, mcr, mf, fitness, penalty, eps, ftar_method, state)
                     v = mutation_results(f, ftar, pop_best, pop_pbest, pop, i, class_labels, evals, pop_max, pop_min, state.np_g)
                     u = crossover(pop[i], v, cr, pop_max, pop_min, evals)
                     u_fitness, u_penalty, u_inf = get_fitness_and_penalty(u, evals, opmwade_repair_inf=True)
@@ -483,12 +654,12 @@ def run(
                     pop_pbest,
                     pbest_fitness,
                     pbest_penalty,
+                    best_fitness_history,
                 )
                 population_size_process = append_population_size_record(population_size_process, state)
-                if state.nfes + state.np_g <= state.nfes_max:
-                    pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
-                        pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
-                    )
+                pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
+                    pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
+                )
                 current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
                 reporter.maybe(
                     state,
