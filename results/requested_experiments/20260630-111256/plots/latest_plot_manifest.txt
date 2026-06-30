@@ -1,0 +1,22 @@
+Source: /home/zyq/FLRM_YanExp/FLRM_ControlSystemAndSDSAHA/results/requested_experiments/20260630-111256
+Generated plots:
+- latest_result_curves.png (284710 bytes)
+- latest_result_curves.svg (158924 bytes)
+- latest_opmwade_population_size_curves.png (301379 bytes)
+- latest_opmwade_population_size_curves.svg (171591 bytes)
+
+Final summary rows:
+group1_algorithm_comparison_adaptive_target_1_05_mass_9_78g | DSI-C2oDE | best=0.00537378809451 | fearate=1 | time=5719.843s
+group1_algorithm_comparison_adaptive_target_1_05_mass_9_78g | EDA++ | best=0.00555323195343 | fearate=1 | time=5132.115s
+group1_algorithm_comparison_adaptive_target_1_05_mass_9_78g | OPMWADE | best=0.00905663980723 | fearate=1 | time=5032.618s
+group1_algorithm_comparison_adaptive_target_1_05_mass_9_78g | RND | best=0.0190190846618 | fearate=1 | time=4990.065s
+group1_algorithm_comparison_adaptive_target_1_05_mass_9_78g | TPDE | best=0.0048432695664 | fearate=1 | time=5126.327s
+group2_adaptive_damping_three_angles_mass_9_78g | target=1.05 rad | best=0.00905663980723 | fearate=1 | time=5032.618s
+group2_adaptive_damping_three_angles_mass_9_78g | target=1.57 rad | best=0.0182373058141 | fearate=1 | time=5009.410s
+group2_adaptive_damping_three_angles_mass_9_78g | target=2.09 rad | best=0.032347336677 | fearate=1 | time=5011.799s
+group3_adaptive_damping_target_1_05_three_masses | mass=9.78 g | best=0.00905663980723 | fearate=1 | time=5032.618s
+group3_adaptive_damping_target_1_05_three_masses | mass=19.30 g | best=0.00861278245541 | fearate=1 | time=5022.945s
+group3_adaptive_damping_target_1_05_three_masses | mass=40.47 g | best=0.00990765519097 | fearate=1 | time=5010.856s
+group4_opmwade_three_damping_modes_target_1_05_mass_9_78g | none | best=0.00984916590252 | fearate=1 | time=4741.594s
+group4_opmwade_three_damping_modes_target_1_05_mass_9_78g | fixed | best=0.00993716364091 | fearate=1 | time=4903.905s
+group4_opmwade_three_damping_modes_target_1_05_mass_9_78g | adaptive | best=0.00905663980723 | fearate=1 | time=5032.618s
