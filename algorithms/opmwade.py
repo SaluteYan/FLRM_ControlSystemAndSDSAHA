@@ -9,6 +9,8 @@ from .common import (
     RunResult,
     WORKSPACE_ROOT,
     best_and_fearate,
+    best_individual_diagnostics,
+    best_individual_by_feasibility,
     configure_problem_from_init_data,
     enforce_problem21_coupling,
     generate_population,
@@ -38,6 +40,10 @@ ADAPTIVE_NP_MIN_SLOW_SHRINK_RATIO = 0.6
 P21_MIN_NP_DIM_FACTOR = 2.5
 P21_MIN_NP_RELEASE_PROGRESS = 0.8
 P21_ENHANCEMENT_MIN_NFES = 4000
+P21_FORCE_SHRINK_START_PROGRESS = 0.32
+P21_FORCE_SHRINK_FINAL_PROGRESS = 0.50
+P21_FORCE_SHRINK_STAGNATION = 0.80
+P21_FORCE_SHRINK_DIM_FACTOR = 3.0
 CONSTRAINT_AWARE_FTAR_METHOD = 4
 FTAR_MIN = 0.25
 FTAR_MAX = 0.75
@@ -61,15 +67,37 @@ STAGNATION_RESAMPLE_START_PROGRESS = 0.65
 STAGNATION_RESAMPLE_COOLDOWN = 0.08
 STAGNATION_RESAMPLE_SIGMA_INITIAL = 0.04
 STAGNATION_RESAMPLE_SIGMA_FINAL = 0.015
-LOCAL_REFINE_START_PROGRESS = 0.85
-LOCAL_REFINE_STAGNATION_THRESHOLD = 0.95
-LOCAL_REFINE_DIVERSITY_THRESHOLD = 0.03
-LOCAL_REFINE_COOLDOWN = 0.04
+LOCAL_REFINE_START_PROGRESS = 0.35
+LOCAL_REFINE_STAGNATION_THRESHOLD = 0.80
+LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD = 0.08
+LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD = 0.18
+LOCAL_REFINE_COOLDOWN = 0.06
 LOCAL_REFINE_MAX_TRIALS = 4
 LOCAL_REFINE_SIGMA_INITIAL = 0.012
 LOCAL_REFINE_SIGMA_FINAL = 0.0025
 LOCAL_REFINE_DIFF_INITIAL = 0.12
 LOCAL_REFINE_DIFF_FINAL = 0.03
+DIAGNOSTIC_COLUMNS = np.array(
+    [
+        "repeat",
+        "iter",
+        "nfes",
+        "np",
+        "best",
+        "feasible_rate",
+        "accept_rate",
+        "best_improved",
+        "mean_delta_f",
+        "fitness_diversity",
+        "decision_diversity",
+        "mean_f",
+        "mean_cr",
+        "mean_ftar",
+        "did_resample",
+        "local_refine_attempted",
+        "local_refine_accepted",
+    ]
+)
 
 
 def _cauchy(mu: float, gamma: float) -> float:
@@ -103,6 +131,21 @@ def _feasible_fitness_values(fitness: np.ndarray, penalty: np.ndarray) -> np.nda
     return feasible_fitness[np.isfinite(feasible_fitness)]
 
 
+def _decision_space_diversity(pop: np.ndarray | None, pop_min: np.ndarray | None, pop_max: np.ndarray | None) -> float:
+    if pop is None or pop_min is None or pop_max is None:
+        return 0.0
+    arr = np.asarray(pop, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] <= 1:
+        return 0.0
+    span = np.maximum(np.asarray(pop_max, dtype=float) - np.asarray(pop_min, dtype=float), 1e-12)
+    normalized = (arr - arr[0]) / span
+    distances = np.linalg.norm(normalized, axis=1) / np.sqrt(arr.shape[1])
+    distances = distances[np.isfinite(distances)]
+    if distances.size == 0:
+        return 0.0
+    return float(np.mean(distances))
+
+
 def _best_history_improve_rate(best_history: list[float] | None, best_now: float) -> float:
     if best_history:
         lookback_index = max(0, len(best_history) - ADAPTIVE_NP_LOOKBACK)
@@ -121,6 +164,9 @@ def _search_metrics(
     penalty: np.ndarray,
     best_history: list[float] | None,
     evals: int | None = None,
+    pop: np.ndarray | None = None,
+    pop_min: np.ndarray | None = None,
+    pop_max: np.ndarray | None = None,
 ) -> dict[str, float]:
     progress = float(np.clip(state.nfes / max(state.nfes_max, 1), 0.0, 1.0))
     feasible_fitness = _feasible_fitness_values(fitness, penalty)
@@ -146,6 +192,7 @@ def _search_metrics(
         "improve_rate": improve_rate,
         "feasible_rate": feasible_rate,
         "fitness_diversity": fitness_diversity,
+        "decision_diversity": _decision_space_diversity(pop, pop_min, pop_max),
         "diversity_score": diversity_score,
         "stagnation_score": stagnation_score,
         "nfes_max": float(state.nfes_max),
@@ -628,7 +675,7 @@ def should_local_refine(
 ) -> bool:
     if int(metrics.get("evals", 0.0)) != 21:
         return False
-    if not _late_enhancements_active(metrics):
+    if float(metrics.get("nfes_max", 0.0)) < P21_ENHANCEMENT_MIN_NFES:
         return False
     if elite_pop.size == 0 or metrics["progress"] < LOCAL_REFINE_START_PROGRESS:
         return False
@@ -637,7 +684,8 @@ def should_local_refine(
         return False
     return (
         metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
-        and metrics["fitness_diversity"] <= LOCAL_REFINE_DIVERSITY_THRESHOLD
+        and metrics["fitness_diversity"] <= LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD
+        and metrics["decision_diversity"] <= LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD
     )
 
 
@@ -713,6 +761,24 @@ def _feasible_best(fitness: np.ndarray, penalty: np.ndarray) -> float:
     return float(np.min(feasible_fitness))
 
 
+def _p21_force_shrink_target(metrics: dict[str, float] | None, np_min: int, pop_dim: int) -> int | None:
+    if metrics is None:
+        return None
+    if int(metrics.get("evals", 0.0)) != 21:
+        return None
+    if float(metrics.get("nfes_max", 0.0)) < P21_ENHANCEMENT_MIN_NFES:
+        return None
+    progress = float(metrics.get("progress", 0.0))
+    stagnated = float(metrics.get("stagnation_score", 0.0)) >= P21_FORCE_SHRINK_STAGNATION
+    if not stagnated:
+        return None
+    if progress >= P21_FORCE_SHRINK_FINAL_PROGRESS:
+        return int(np_min)
+    if progress >= P21_FORCE_SHRINK_START_PROGRESS:
+        return max(int(np_min), int(round(P21_FORCE_SHRINK_DIM_FACTOR * pop_dim)))
+    return None
+
+
 def _effective_np_min(
     np_min: int,
     pop_dim: int,
@@ -726,9 +792,14 @@ def _effective_np_min(
         return int(np_min)
     if nfes_max is not None and nfes_max < P21_ENHANCEMENT_MIN_NFES:
         return int(np_min)
+    if _p21_force_shrink_target(metrics, np_min, pop_dim) is not None:
+        return int(np_min)
     if metrics is not None and _late_enhancements_active(metrics):
         stagnated = metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
-        collapsed = metrics["fitness_diversity"] <= LOCAL_REFINE_DIVERSITY_THRESHOLD
+        collapsed = (
+            metrics["fitness_diversity"] <= LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD
+            and metrics["decision_diversity"] <= LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD
+        )
         if stagnated and collapsed:
             return int(np_min)
     protected_min = max(int(np_min), int(round(P21_MIN_NP_DIM_FACTOR * pop_dim)))
@@ -787,6 +858,10 @@ def _adaptive_population_size(
             injection = max(1, int(round(0.02 * np_max * late_decay)))
             new_np = max(new_np, slow_shrink_np + injection)
 
+    force_target = _p21_force_shrink_target(metrics, np_min, pop_dim)
+    if force_target is not None:
+        new_np = min(new_np, force_target)
+
     return int(np.clip(new_np, effective_min, np_max))
 
 
@@ -815,7 +890,11 @@ def num_pop_update(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     old_np = state.np_g
     progress = state.nfes / max(state.nfes_max, 1)
-    np_metrics = _search_metrics(state, fitness, penalty, best_history, evals) if num_method == ADAPTIVE_NP_METHOD else None
+    np_metrics = (
+        _search_metrics(state, fitness, penalty, best_history, evals, pop, pop_min, pop_max)
+        if num_method == ADAPTIVE_NP_METHOD
+        else None
+    )
     if num_method == ADAPTIVE_NP_METHOD:
         new_np = _adaptive_population_size(
             state,
@@ -894,6 +973,51 @@ def append_population_size_record(process: np.ndarray, state: EvalState) -> np.n
     return row if process.size == 0 else np.vstack([process, row])
 
 
+def append_diagnostic_record(
+    diagnostics: np.ndarray,
+    repeat_index: int,
+    iteration_index: int,
+    state: EvalState,
+    best: float,
+    metrics: dict[str, float],
+    accept_rate: float,
+    best_improved: bool,
+    mean_delta_f: float,
+    mean_f: float,
+    mean_cr: float,
+    mean_ftar: float,
+    did_resample: bool,
+    local_refine_attempted: bool,
+    local_refine_accepted: bool,
+) -> np.ndarray:
+    row = np.array(
+        [
+            float(repeat_index),
+            float(iteration_index),
+            float(state.nfes),
+            float(state.np_g),
+            float(best),
+            float(metrics.get("feasible_rate", 0.0)),
+            float(accept_rate),
+            float(best_improved),
+            float(mean_delta_f),
+            float(metrics.get("fitness_diversity", 0.0)),
+            float(metrics.get("decision_diversity", 0.0)),
+            float(mean_f),
+            float(mean_cr),
+            float(mean_ftar),
+            float(did_resample),
+            float(local_refine_attempted),
+            float(local_refine_accepted),
+        ]
+    ).reshape(1, -1)
+    return row if diagnostics.size == 0 else np.vstack([diagnostics, row])
+
+
+def final_best_individual(pop: np.ndarray, fitness: np.ndarray, penalty: np.ndarray, evals: int) -> tuple[np.ndarray, float, float]:
+    return best_individual_by_feasibility(pop, fitness, penalty, evals, variant="opmwade")
+
+
 def run(
     evals_range: Iterable[int] = (21,),
     repeat_num: int = 1,
@@ -919,6 +1043,10 @@ def run(
         fearates: list[float] = []
         process = np.empty((0, 2))
         population_size_process = np.empty((0, 2))
+        diagnostic_process = np.empty((0, DIAGNOSTIC_COLUMNS.size))
+        best_individuals: list[np.ndarray] = []
+        best_individual_fitness: list[float] = []
+        best_individual_penalty: list[float] = []
 
         for repeat_index in range(1, repeat_num + 1):
             start = timed()
@@ -993,8 +1121,12 @@ def run(
                 sf = np.zeros(state.np_g)
                 delta_f = np.zeros(state.np_g)
                 inf_u = np.zeros(state.np_g)
+                f_values = np.zeros(state.np_g)
+                cr_values = np.zeros(state.np_g)
+                ftar_values = np.zeros(state.np_g)
                 eps = generate_epsilon(eps0, lamta, p, state)
-                metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals)
+                metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
+                best_before_iteration = metrics["best_now"]
                 if enable_late_enhancements and _late_enhancements_active(metrics):
                     pbest_pool = build_pbest_pool(
                         pop,
@@ -1022,6 +1154,9 @@ def run(
                         metrics,
                         enable_late_enhancements,
                     )
+                    f_values[i] = f
+                    cr_values[i] = cr
+                    ftar_values[i] = ftar
                     v = mutation_results(f, ftar, pop_best, pop_pbest, pbest_pool, pop, i, class_labels, evals, pop_max, pop_min, state.np_g)
                     u = crossover(pop[i], v, cr, pop_max, pop_min, evals)
                     u_fitness, u_penalty, u_inf = get_fitness_and_penalty(u, evals, opmwade_repair_inf=True)
@@ -1048,9 +1183,16 @@ def run(
                     )
 
                 state.nfes += state.np_g + int(np.sum(inf_u != 0))
-                scr = scr[scr != -1]
-                sf = sf[sf != -1]
-                delta_f = delta_f[delta_f != -1]
+                accepted_mask = scr != -1
+                accept_rate = float(np.mean(accepted_mask)) if accepted_mask.size else 0.0
+                accepted_delta = delta_f[accepted_mask]
+                mean_delta_f = float(np.mean(accepted_delta)) if accepted_delta.size else 0.0
+                mean_f = float(np.mean(f_values)) if f_values.size else 0.0
+                mean_cr = float(np.mean(cr_values)) if cr_values.size else 0.0
+                mean_ftar = float(np.mean(ftar_values)) if ftar_values.size else 0.0
+                scr = scr[accepted_mask]
+                sf = sf[accepted_mask]
+                delta_f = delta_f[accepted_mask]
 
                 pop = pop_next.copy()
                 fitness = pop_next_fitness.copy()
@@ -1102,7 +1244,7 @@ def run(
                     enable_late_enhancements,
                 )
                 did_resample = False
-                resample_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals)
+                resample_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
                 if enable_late_enhancements and should_resample_stagnated_tail(resample_metrics, state, last_resample_nfes, elite_archive_pop):
                     (
                         pop,
@@ -1135,9 +1277,11 @@ def run(
                     if did_resample:
                         last_resample_nfes = state.nfes
                 did_refine = False
-                refine_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals)
+                attempted_refine = False
+                refine_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
                 eps = generate_epsilon(eps0, lamta, p, state)
                 if enable_late_enhancements and should_local_refine(refine_metrics, state, last_refine_nfes, elite_archive_pop):
+                    attempted_refine = True
                     (
                         pop,
                         fitness,
@@ -1189,6 +1333,24 @@ def run(
                     )
                     process = process_best_record(process, pop, fitness, penalty, state.nfes, evals, variant="opmwade")
                 current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
+                end_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
+                diagnostic_process = append_diagnostic_record(
+                    diagnostic_process,
+                    repeat_index,
+                    iteration_index,
+                    state,
+                    current_best,
+                    end_metrics,
+                    accept_rate,
+                    np.isfinite(best_before_iteration) and current_best < best_before_iteration - 1e-12,
+                    mean_delta_f,
+                    mean_f,
+                    mean_cr,
+                    mean_ftar,
+                    did_resample,
+                    attempted_refine,
+                    did_refine,
+                )
                 reporter.maybe(
                     state,
                     best=current_best,
@@ -1198,6 +1360,10 @@ def run(
 
             best, fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
             reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
+            best_x, best_x_fitness, best_x_penalty = final_best_individual(pop, fitness, penalty, evals)
+            best_individuals.append(best_x)
+            best_individual_fitness.append(best_x_fitness)
+            best_individual_penalty.append(best_x_penalty)
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)
@@ -1208,17 +1374,40 @@ def run(
             evals,
             *summary,
             process=process,
-            diagnostics={"population_size_and_nfes": population_size_process},
+            diagnostics={
+                "population_size_and_nfes": population_size_process,
+                "diagnostic_columns": DIAGNOSTIC_COLUMNS,
+                "diagnostic_process": diagnostic_process,
+                **best_individual_diagnostics(
+                    best_individuals,
+                    best_individual_fitness,
+                    best_individual_penalty,
+                ),
+            },
         )
         results.append(result)
         if save:
             row = np.zeros((21, 8))
             row[evals - 1, :] = np.array([evals, *summary])
+            best_diag = result.diagnostics
             save_mat(
                 WORKSPACE_ROOT / "results" / "opmwade" / f"OPMWADE-P{evals}.mat",
                 everyevalBestMediMeanWorstStdFearateTime=row,
                 testProcessBestFitAndNfes=process,
                 testProcessPopulationSizeAndNfes=population_size_process,
+                testProcessDiagnostics=diagnostic_process,
+                testDiagnosticColumns=DIAGNOSTIC_COLUMNS,
+                testBestIndividuals=np.vstack(best_individuals) if best_individuals else np.empty((0, 0)),
+                testBestIndividualFitness=np.asarray(best_individual_fitness, dtype=float),
+                testBestIndividualPenalty=np.asarray(best_individual_penalty, dtype=float),
+                testSummaryBestIndividual=best_diag["summary_best_individual"].reshape(1, -1)
+                if best_diag["summary_best_individual"].size
+                else np.empty((0, 0)),
+                testSummaryBestIndividualFitness=best_diag["summary_best_individual_fitness"],
+                testSummaryBestIndividualPenalty=best_diag["summary_best_individual_penalty"],
+                testFinalBestIndividual=best_diag["final_best_individual"].reshape(1, -1)
+                if best_diag["final_best_individual"].size
+                else np.empty((0, 0)),
             )
     return results
 

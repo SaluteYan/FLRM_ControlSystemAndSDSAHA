@@ -10,6 +10,7 @@ from .common import (
     ProgressReporter,
     RunResult,
     WORKSPACE_ROOT,
+    best_individual_diagnostics,
     configure_problem_from_init_data,
     enforce_problem21_coupling,
     fearate_calculate,
@@ -321,6 +322,21 @@ def evaluated_best_and_fearate(
     return (float(np.min(feasible_fitness)) if feasible_fitness.size else float("inf")), fearate
 
 
+def evaluated_best_individual(
+    pop_pbest: np.ndarray,
+    pbest_fitness: np.ndarray,
+    pbest_penalty: np.ndarray,
+    evals: int,
+) -> tuple[np.ndarray, float, float]:
+    feasible = fearate_calculate(pop_pbest, evals, pbest_penalty) > 0
+    if np.any(feasible):
+        feasible_idx = np.flatnonzero(feasible)
+        idx = int(feasible_idx[np.argmin(pbest_fitness[feasible_idx])])
+    else:
+        idx = int(np.argmin(pbest_penalty))
+    return pop_pbest[idx].copy(), float(pbest_fitness[idx]), float(pbest_penalty[idx])
+
+
 def run(
     evals_range: Iterable[int] = (21,),
     repeat_num: int = 1,
@@ -344,6 +360,9 @@ def run(
         fearates: list[float] = []
         times: list[float] = []
         process = np.empty((0, 2))
+        best_individuals: list[np.ndarray] = []
+        best_individual_fitness: list[float] = []
+        best_individual_penalty: list[float] = []
 
         for repeat_index in range(1, repeat_num + 1):
             start = timed()
@@ -460,18 +479,42 @@ def run(
                     break
 
             best, fearate = evaluated_best_and_fearate(pop_pbest, pbest_fitness, pbest_penalty, evals)
+            best_x, best_x_fit, best_x_pen = evaluated_best_individual(pop_pbest, pbest_fitness, pbest_penalty, evals)
             reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
+            best_individuals.append(best_x)
+            best_individual_fitness.append(best_x_fit)
+            best_individual_penalty.append(best_x_pen)
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)
 
         summary = summarize(best_values, fearates, times)
-        result = RunResult("RND", evals, *summary, process=process)
+        result = RunResult("RND", evals, *summary, process=process, diagnostics=best_individual_diagnostics(
+            best_individuals,
+            best_individual_fitness,
+            best_individual_penalty,
+        ))
         results.append(result)
         if save:
             row = np.zeros((21, 8))
             row[evals - 1, :] = np.array([evals, *summary])
-            save_mat(WORKSPACE_ROOT / "results" / "rnd" / f"RND-P{evals}.mat", everyevalBestMediMeanWorstStdFearateTime=row, testProcessBestFitAndNfes=process)
+            best_diag = result.diagnostics
+            save_mat(
+                WORKSPACE_ROOT / "results" / "rnd" / f"RND-P{evals}.mat",
+                everyevalBestMediMeanWorstStdFearateTime=row,
+                testProcessBestFitAndNfes=process,
+                testBestIndividuals=np.vstack(best_individuals) if best_individuals else np.empty((0, 0)),
+                testBestIndividualFitness=np.asarray(best_individual_fitness, dtype=float),
+                testBestIndividualPenalty=np.asarray(best_individual_penalty, dtype=float),
+                testSummaryBestIndividual=best_diag["summary_best_individual"].reshape(1, -1)
+                if best_diag["summary_best_individual"].size
+                else np.empty((0, 0)),
+                testSummaryBestIndividualFitness=best_diag["summary_best_individual_fitness"],
+                testSummaryBestIndividualPenalty=best_diag["summary_best_individual_penalty"],
+                testFinalBestIndividual=best_diag["final_best_individual"].reshape(1, -1)
+                if best_diag["final_best_individual"].size
+                else np.empty((0, 0)),
+            )
     return results
 
 

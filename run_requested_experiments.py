@@ -160,6 +160,19 @@ def run_unique_experiment(
     return experiment_key(experiment), runner(**runner_kwargs(experiment, options, init_file))
 
 
+def best_individual_summary(result: RunResult) -> str:
+    values = result.diagnostics.get("summary_best_individual")
+    if values is None:
+        values = result.diagnostics.get("final_best_individual")
+    if values is None:
+        return ""
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    if not values:
+        return ""
+    return json.dumps(values, ensure_ascii=False)
+
+
 def result_row(experiment: Experiment, result: RunResult, init_file: Path, process_file: Path) -> dict[str, str | int | float]:
     return {
         "group": experiment.group,
@@ -180,6 +193,7 @@ def result_row(experiment: Experiment, result: RunResult, init_file: Path, proce
         "fearate": result.fearate,
         "elapsed_time": result.elapsed_time,
         "process_file": str(process_file),
+        "best_individual": best_individual_summary(result),
     }
 
 

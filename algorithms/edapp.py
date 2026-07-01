@@ -12,6 +12,8 @@ from .common import (
     RunResult,
     WORKSPACE_ROOT,
     best_and_fearate,
+    best_individual_by_feasibility,
+    best_individual_diagnostics,
     configure_problem_from_init_data,
     enforce_problem21_coupling,
     fearate_calculate,
@@ -309,6 +311,9 @@ def run(
         fearates: list[float] = []
         times: list[float] = []
         process = np.empty((0, 2))
+        best_individuals: list[np.ndarray] = []
+        best_individual_fitness: list[float] = []
+        best_individual_penalty: list[float] = []
 
         for repeat_index in range(1, repeat_num + 1):
             start = timed()
@@ -375,18 +380,47 @@ def run(
             best, fearate = best_and_fearate(pop, fitness, penalty, evals)
             if pop_gbest_fitness is not None:
                 best = pop_gbest_fitness
+                best_x = pop_gbest.copy()
+                best_x_fitness, best_x_penalty, _ = get_fitness_and_penalty(best_x, evals)
+                best_x_fit = float(best_x_fitness[0])
+                best_x_pen = float(best_x_penalty[0])
+            else:
+                best_x, best_x_fit, best_x_pen = best_individual_by_feasibility(pop, fitness, penalty, evals)
             reporter.maybe(state, best=best, fearate=fearate, extra={"iter": iteration_index, "np": state.np_g}, force=True)
+            best_individuals.append(best_x)
+            best_individual_fitness.append(best_x_fit)
+            best_individual_penalty.append(best_x_pen)
             best_values.append(best)
             fearates.append(fearate)
             times.append(timed() - start)
 
         summary = summarize(best_values, fearates, times)
-        result = RunResult("EDA++", evals, *summary, process=process)
+        result = RunResult("EDA++", evals, *summary, process=process, diagnostics=best_individual_diagnostics(
+            best_individuals,
+            best_individual_fitness,
+            best_individual_penalty,
+        ))
         results.append(result)
         if save:
             row = np.zeros((21, 8))
             row[evals - 1, :] = np.array([evals, *summary])
-            save_mat(WORKSPACE_ROOT / "results" / "edapp" / f"EDAPP-P{evals}.mat", everyevalBestMediMeanWorstStdFearateTime=row, testProcessBestFitAndNfes=process)
+            best_diag = result.diagnostics
+            save_mat(
+                WORKSPACE_ROOT / "results" / "edapp" / f"EDAPP-P{evals}.mat",
+                everyevalBestMediMeanWorstStdFearateTime=row,
+                testProcessBestFitAndNfes=process,
+                testBestIndividuals=np.vstack(best_individuals) if best_individuals else np.empty((0, 0)),
+                testBestIndividualFitness=np.asarray(best_individual_fitness, dtype=float),
+                testBestIndividualPenalty=np.asarray(best_individual_penalty, dtype=float),
+                testSummaryBestIndividual=best_diag["summary_best_individual"].reshape(1, -1)
+                if best_diag["summary_best_individual"].size
+                else np.empty((0, 0)),
+                testSummaryBestIndividualFitness=best_diag["summary_best_individual_fitness"],
+                testSummaryBestIndividualPenalty=best_diag["summary_best_individual_penalty"],
+                testFinalBestIndividual=best_diag["final_best_individual"].reshape(1, -1)
+                if best_diag["final_best_individual"].size
+                else np.empty((0, 0)),
+            )
     return results
 
 

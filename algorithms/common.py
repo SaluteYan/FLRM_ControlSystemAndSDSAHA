@@ -944,6 +944,60 @@ def best_and_fearate(
     return (float(np.min(values)) if values.size else float("inf")), fearate
 
 
+def best_individual_by_feasibility(
+    pop: np.ndarray,
+    fitness: np.ndarray,
+    penalty: np.ndarray,
+    evals: int | None = None,
+    variant: str = "standard",
+) -> tuple[np.ndarray, float, float]:
+    arr = as_2d(pop)
+    fit = np.asarray(fitness, dtype=float).reshape(-1)
+    pen = np.asarray(penalty, dtype=float).reshape(-1)
+    feasible = (fearate_calculate(arr, evals, pen, variant=variant) > 0) if evals is not None else (pen <= 0)
+    if np.any(feasible):
+        feasible_idx = np.flatnonzero(feasible)
+        idx = int(feasible_idx[np.argmin(fit[feasible_idx])])
+    else:
+        idx = int(np.argmin(pen))
+    return arr[idx].copy(), float(fit[idx]), float(pen[idx])
+
+
+def best_individual_diagnostics(
+    best_individuals: list[np.ndarray],
+    best_fitness: list[float],
+    best_penalty: list[float],
+) -> dict[str, np.ndarray]:
+    individuals = np.vstack(best_individuals) if best_individuals else np.empty((0, 0))
+    fitness = np.asarray(best_fitness, dtype=float)
+    penalty = np.asarray(best_penalty, dtype=float)
+    if individuals.size:
+        finite_fitness = np.isfinite(fitness)
+        if np.any(finite_fitness):
+            finite_idx = np.flatnonzero(finite_fitness)
+            summary_idx = int(finite_idx[np.argmin(fitness[finite_idx])])
+        else:
+            summary_idx = int(np.argmin(penalty))
+        summary_best = individuals[summary_idx].copy()
+        summary_fitness = np.array(fitness[summary_idx], dtype=float)
+        summary_penalty = np.array(penalty[summary_idx], dtype=float)
+        final_best = best_individuals[-1].copy()
+    else:
+        summary_best = np.empty(0)
+        summary_fitness = np.array(np.nan, dtype=float)
+        summary_penalty = np.array(np.nan, dtype=float)
+        final_best = np.empty(0)
+    return {
+        "best_individuals": individuals,
+        "best_individual_fitness": fitness,
+        "best_individual_penalty": penalty,
+        "summary_best_individual": summary_best,
+        "summary_best_individual_fitness": summary_fitness,
+        "summary_best_individual_penalty": summary_penalty,
+        "final_best_individual": final_best,
+    }
+
+
 def summarize(values: list[float], fearates: list[float], times: list[float]) -> tuple[float, float, float, float, float, float, float]:
     arr = np.asarray(values, dtype=float)
     return (
