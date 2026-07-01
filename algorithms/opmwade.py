@@ -42,9 +42,6 @@ ADAPTIVE_NP_SLOW_SHRINK_RATIO = 0.95
 ADAPTIVE_NP_MIN_SLOW_SHRINK_RATIO = 0.6
 INITIAL_NP_DIM_FACTOR = 18.0
 MIN_NP_DIM_FACTOR = 5.0
-ENHANCEMENT_MIN_NFES = 4000
-FORCE_SHRINK_START_PROGRESS = 0.32
-FORCE_SHRINK_STAGNATION = 0.80
 CONSTRAINT_AWARE_FTAR_METHOD = 4
 FTAR_MIN = 0.25
 FTAR_MAX = 0.75
@@ -58,33 +55,39 @@ SUCCESS_PENALTY_WEIGHT = 0.25
 SUCCESS_OBJECTIVE_BASE = 0.5
 SUCCESS_OBJECTIVE_FEASIBLE_GAIN = 1.0
 SUCCESS_PENALTY_INFEASIBLE_GAIN = 1.0
-LATE_ENHANCEMENT_START_PROGRESS = 0.55
 PBEST_FRACTION = 0.15
 PBEST_MIN_COUNT = 4
 ELITE_ARCHIVE_SIZE_FACTOR = 2.0
+STATE_HISTORY_MIN_GENERATIONS = 3
+STATE_ENHANCEMENT_STAGNATION = 0.75
+STATE_ENHANCEMENT_STALL_GENERATIONS = 4
+STATE_ENHANCEMENT_LOW_ACCEPT_RATE = 0.12
+STATE_ENHANCEMENT_FITNESS_DIVERSITY = 0.16
+STATE_ENHANCEMENT_DECISION_DIVERSITY = 0.20
 STAGNATION_RESAMPLE_FRACTION = 0.3
 STAGNATION_RESAMPLE_THRESHOLD = 0.9
 STAGNATION_RESAMPLE_DIVERSITY = 0.06
-STAGNATION_RESAMPLE_START_PROGRESS = 0.65
-STAGNATION_RESAMPLE_COOLDOWN = 0.08
-STAGNATION_RESAMPLE_SIGMA_INITIAL = 0.04
-STAGNATION_RESAMPLE_SIGMA_FINAL = 0.015
-LOCAL_REFINE_START_PROGRESS = 0.35
+STAGNATION_RESAMPLE_STALL_GENERATIONS = 5
+STAGNATION_RESAMPLE_LOW_ACCEPT_RATE = 0.08
+STAGNATION_RESAMPLE_COOLDOWN_GENERATIONS = 4
+STAGNATION_RESAMPLE_SIGMA_MIN = 0.015
+STAGNATION_RESAMPLE_SIGMA_MAX = 0.04
 LOCAL_REFINE_STAGNATION_THRESHOLD = 0.80
 LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD = 0.08
 LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD = 0.18
-LOCAL_REFINE_COOLDOWN = 0.06
+LOCAL_REFINE_STALL_GENERATIONS = 4
+LOCAL_REFINE_LOW_ACCEPT_RATE = 0.08
+LOCAL_REFINE_COOLDOWN_GENERATIONS = 4
 LOCAL_REFINE_MAX_TRIALS = 4
-LOCAL_REFINE_SIGMA_INITIAL = 0.012
-LOCAL_REFINE_SIGMA_FINAL = 0.0025
-LOCAL_REFINE_DIFF_INITIAL = 0.12
-LOCAL_REFINE_DIFF_FINAL = 0.03
+LOCAL_REFINE_SIGMA_MIN = 0.0025
+LOCAL_REFINE_SIGMA_MAX = 0.012
+LOCAL_REFINE_DIFF_MIN = 0.03
+LOCAL_REFINE_DIFF_MAX = 0.12
 ROLE_EXPLOIT = 1
 ROLE_BALANCE = 2
 ROLE_EXPLORE = 3
 ROLE_EXPLOIT_FRACTION = 0.30
 ROLE_EXPLORE_FRACTION = 0.30
-ROLE_LATE_PROGRESS = 0.65
 ROLE_LOW_DIVERSITY_THRESHOLD = 0.02
 ROLE_STAGNATION_THRESHOLD = 0.80
 DIAGNOSTIC_COLUMNS = np.array(
@@ -168,6 +171,36 @@ def _best_history_improve_rate(best_history: list[float] | None, best_now: float
     return 0.0
 
 
+def _best_history_stall_generations(best_history: list[float] | None) -> int:
+    if not best_history or len(best_history) <= 1:
+        return 0
+
+    values = np.asarray(best_history, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size <= 1:
+        return 0
+
+    best_so_far = float(values[0])
+    stall_generations = 0
+    for value in values[1:]:
+        if value < best_so_far - 1e-12:
+            best_so_far = float(value)
+            stall_generations = 0
+        else:
+            stall_generations += 1
+    return int(stall_generations)
+
+
+def _recent_accept_rate(accept_rate_history: list[float] | None) -> float:
+    if not accept_rate_history:
+        return 1.0
+    values = np.asarray(accept_rate_history[-ADAPTIVE_NP_LOOKBACK:], dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 1.0
+    return float(np.mean(values))
+
+
 def _search_metrics(
     state: EvalState,
     fitness: np.ndarray,
@@ -177,6 +210,7 @@ def _search_metrics(
     pop: np.ndarray | None = None,
     pop_min: np.ndarray | None = None,
     pop_max: np.ndarray | None = None,
+    accept_rate_history: list[float] | None = None,
 ) -> dict[str, float]:
     progress = float(np.clip(state.nfes / max(state.nfes_max, 1), 0.0, 1.0))
     feasible_fitness = _feasible_fitness_values(fitness, penalty)
@@ -205,17 +239,44 @@ def _search_metrics(
         "decision_diversity": _decision_space_diversity(pop, pop_min, pop_max),
         "diversity_score": diversity_score,
         "stagnation_score": stagnation_score,
+        "stagnation_generations": float(_best_history_stall_generations(best_history)),
+        "recent_accept_rate": _recent_accept_rate(accept_rate_history),
+        "history_size": float(len(best_history or [])),
         "nfes_max": float(state.nfes_max),
         "evals": float(evals or 0),
     }
 
 
-def _late_enhancements_active(metrics: dict[str, float] | None) -> bool:
+def _state_enhancements_active(metrics: dict[str, float] | None) -> bool:
     if metrics is None:
         return False
-    if float(metrics.get("nfes_max", 0.0)) < ENHANCEMENT_MIN_NFES:
+    if float(metrics.get("history_size", 0.0)) < STATE_HISTORY_MIN_GENERATIONS:
         return False
-    return float(metrics.get("progress", 0.0)) >= LATE_ENHANCEMENT_START_PROGRESS
+
+    stagnated = (
+        float(metrics.get("stagnation_score", 0.0)) >= STATE_ENHANCEMENT_STAGNATION
+        or float(metrics.get("stagnation_generations", 0.0)) >= STATE_ENHANCEMENT_STALL_GENERATIONS
+    )
+    low_acceptance = float(metrics.get("recent_accept_rate", 1.0)) <= STATE_ENHANCEMENT_LOW_ACCEPT_RATE
+    low_diversity = (
+        float(metrics.get("fitness_diversity", 1.0)) <= STATE_ENHANCEMENT_FITNESS_DIVERSITY
+        or float(metrics.get("decision_diversity", 1.0)) <= STATE_ENHANCEMENT_DECISION_DIVERSITY
+    )
+    poor_feasibility = float(metrics.get("feasible_rate", 1.0)) < 1.0
+    return stagnated and (low_acceptance or low_diversity or poor_feasibility)
+
+
+def _state_enhancement_weight(metrics: dict[str, float] | None) -> float:
+    if metrics is None:
+        return 0.0
+    stagnation = float(np.clip(metrics.get("stagnation_score", 0.0), 0.0, 1.0))
+    stall = float(np.clip(metrics.get("stagnation_generations", 0.0) / max(STATE_ENHANCEMENT_STALL_GENERATIONS, 1), 0.0, 1.0))
+    recent_accept = float(metrics.get("recent_accept_rate", 1.0))
+    low_acceptance = float(np.clip((STATE_ENHANCEMENT_LOW_ACCEPT_RATE - recent_accept) / STATE_ENHANCEMENT_LOW_ACCEPT_RATE, 0.0, 1.0))
+    fitness_collapse = 1.0 - float(np.clip(metrics.get("fitness_diversity", 1.0) / STATE_ENHANCEMENT_FITNESS_DIVERSITY, 0.0, 1.0))
+    decision_collapse = 1.0 - float(np.clip(metrics.get("decision_diversity", 1.0) / STATE_ENHANCEMENT_DECISION_DIVERSITY, 0.0, 1.0))
+    diversity_pressure = max(fitness_collapse, decision_collapse, 0.0)
+    return float(np.clip(0.35 * stagnation + 0.25 * stall + 0.25 * low_acceptance + 0.15 * diversity_pressure, 0.0, 1.0))
 
 
 def _robust_merit_ita(merit: np.ndarray) -> float:
@@ -260,10 +321,8 @@ def constraint_aware_ftar(
     ftar = 1.0 - np.sin(ita * np.pi / 2)
     ftar += FTAR_INFEASIBLE_BOOST * (1.0 - feasible_rate)
     ftar_max = FTAR_MAX
-    if enable_late_enhancements and _late_enhancements_active(metrics):
-        stagnation_score = float(metrics.get("stagnation_score", 0.0))
-        progress = float(metrics.get("progress", 0.0))
-        dynamic_weight = stagnation_score * (0.35 + 0.65 * progress)
+    if enable_late_enhancements and _state_enhancements_active(metrics):
+        dynamic_weight = _state_enhancement_weight(metrics)
         ftar += FTAR_STAGNATION_BOOST * dynamic_weight
         ftar_max = FTAR_MAX + (FTAR_STAGNATION_MAX - FTAR_MAX) * dynamic_weight
     return float(np.clip(ftar, FTAR_MIN, ftar_max))
@@ -409,12 +468,12 @@ def search_role_labels(fitness: np.ndarray, penalty: np.ndarray, metrics: dict[s
     exploit_fraction = ROLE_EXPLOIT_FRACTION
     explore_fraction = ROLE_EXPLORE_FRACTION
     if metrics is not None:
-        progress = float(metrics.get("progress", 0.0))
         decision_diversity = float(metrics.get("decision_diversity", 1.0))
         stagnation_score = float(metrics.get("stagnation_score", 0.0))
-        if progress >= ROLE_LATE_PROGRESS:
-            exploit_fraction = max(0.15, exploit_fraction - 0.05)
-            explore_fraction = min(0.50, explore_fraction + 0.05)
+        state_weight = _state_enhancement_weight(metrics) if _state_enhancements_active(metrics) else 0.0
+        if state_weight > 0:
+            exploit_fraction = max(0.15, exploit_fraction - 0.10 * state_weight)
+            explore_fraction = min(0.55, explore_fraction + 0.15 * state_weight)
         if decision_diversity <= ROLE_LOW_DIVERSITY_THRESHOLD:
             exploit_fraction = max(0.15, exploit_fraction - 0.10)
             explore_fraction = min(0.55, explore_fraction + 0.15)
@@ -517,7 +576,7 @@ def greedy_choose(
     if accepted:
         objective_gain = max(float(person_fitness - u_fitness), 0.0) / (abs(float(person_fitness)) + abs(float(u_fitness)) + 1e-8)
         penalty_gain = max(float(person_penalty - u_penalty), 0.0) / (abs(float(person_penalty)) + abs(float(u_penalty)) + 1e-8)
-        if enable_late_enhancements and _late_enhancements_active(metrics):
+        if enable_late_enhancements and _state_enhancements_active(metrics):
             feasible_rate = float(metrics.get("feasible_rate", 0.0))
             objective_weight = SUCCESS_OBJECTIVE_BASE + SUCCESS_OBJECTIVE_FEASIBLE_GAIN * feasible_rate
             penalty_weight = SUCCESS_PENALTY_INFEASIBLE_GAIN * (1.0 - feasible_rate)
@@ -529,11 +588,22 @@ def greedy_choose(
     return person, float(person_fitness), float(person_penalty), -1.0, -1.0, -1.0
 
 
-def generate_epsilon(eps0: float, lamta: float, p: float, state: EvalState) -> float:
-    cp = -(np.log10(eps0) + lamta) / np.log10(1 - p)
-    if state.nfes / state.nfes_max <= p:
-        return float(eps0 * (1 - state.nfes / state.nfes_max) ** cp)
-    return 0.0
+def generate_epsilon(eps0: float, penalty: np.ndarray, metrics: dict[str, float] | None = None) -> float:
+    positive_penalty = np.asarray(penalty, dtype=float).reshape(-1)
+    positive_penalty = positive_penalty[np.isfinite(positive_penalty) & (positive_penalty > 0)]
+    if positive_penalty.size == 0:
+        return 0.0
+
+    feasible_rate = (
+        float(metrics.get("feasible_rate", 0.0))
+        if metrics is not None
+        else 1.0 - positive_penalty.size / max(np.asarray(penalty).size, 1)
+    )
+    quantile = 75.0 - 50.0 * float(np.clip(feasible_rate, 0.0, 1.0))
+    if metrics is not None and _state_enhancements_active(metrics):
+        quantile += 10.0 * _state_enhancement_weight(metrics)
+    eps = float(np.percentile(positive_penalty, np.clip(quantile, 10.0, 90.0)))
+    return float(np.clip(eps, 0.0, max(float(eps0), 0.0)))
 
 
 def epsilon_better(
@@ -562,14 +632,12 @@ def sort_by_constraint(
     fitness: np.ndarray,
     penalty: np.ndarray,
     eps0: float,
-    lamta: float,
-    p: float,
     pop_pbest: np.ndarray,
     pbest_fitness: np.ndarray,
     pbest_penalty: np.ndarray,
-    state: EvalState,
+    metrics: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    eps = generate_epsilon(eps0, lamta, p, state)
+    eps = generate_epsilon(eps0, penalty, metrics)
     labels = subpopulation_labels(penalty, eps)
     relaxed = penalty <= eps
     strict = ~relaxed
@@ -662,19 +730,19 @@ def should_resample_stagnated_tail(
     last_resample_nfes: int,
     elite_pop: np.ndarray,
 ) -> bool:
-    if not _late_enhancements_active(metrics):
+    if not _state_enhancements_active(metrics):
         return False
     if elite_pop.size == 0:
         return False
-    progress = metrics["progress"]
-    if progress < STAGNATION_RESAMPLE_START_PROGRESS:
-        return False
-    cooldown_nfes = int(round(STAGNATION_RESAMPLE_COOLDOWN * state.nfes_max))
+    cooldown_nfes = STAGNATION_RESAMPLE_COOLDOWN_GENERATIONS * max(state.np_g, 1)
     if state.nfes - last_resample_nfes < max(cooldown_nfes, state.np_g):
         return False
+    low_acceptance = float(metrics.get("recent_accept_rate", 1.0)) <= STAGNATION_RESAMPLE_LOW_ACCEPT_RATE
+    long_stall = float(metrics.get("stagnation_generations", 0.0)) >= STAGNATION_RESAMPLE_STALL_GENERATIONS
+    low_fitness_diversity = metrics["fitness_diversity"] <= STAGNATION_RESAMPLE_DIVERSITY
     return (
         metrics["stagnation_score"] >= STAGNATION_RESAMPLE_THRESHOLD
-        and metrics["fitness_diversity"] <= STAGNATION_RESAMPLE_DIVERSITY
+        and (low_fitness_diversity or low_acceptance or long_stall)
     )
 
 
@@ -703,8 +771,9 @@ def resample_stagnated_tail(
     n_resample = max(1, min(n_resample, state.np_g - 1, remaining_budget))
     replace_idx = np.arange(state.np_g - n_resample, state.np_g)
     elite_idx = np.random.choice(elite_pop.shape[0], size=n_resample, replace=elite_pop.shape[0] < n_resample)
-    progress = metrics["progress"]
-    sigma_ratio = STAGNATION_RESAMPLE_SIGMA_FINAL + (STAGNATION_RESAMPLE_SIGMA_INITIAL - STAGNATION_RESAMPLE_SIGMA_FINAL) * (1.0 - progress)
+    state_weight = _state_enhancement_weight(metrics)
+    diversity_gap = 1.0 - float(np.clip(metrics.get("decision_diversity", 1.0) / STATE_ENHANCEMENT_DECISION_DIVERSITY, 0.0, 1.0))
+    sigma_ratio = STAGNATION_RESAMPLE_SIGMA_MIN + (STAGNATION_RESAMPLE_SIGMA_MAX - STAGNATION_RESAMPLE_SIGMA_MIN) * max(state_weight, diversity_gap)
     sigma = sigma_ratio * (pop_max - pop_min)
     candidates = elite_pop[elite_idx] + np.random.normal(0.0, sigma, size=(n_resample, pop.shape[1]))
     candidates = np.minimum(np.maximum(candidates, pop_min), pop_max)
@@ -731,17 +800,22 @@ def should_local_refine(
     last_refine_nfes: int,
     elite_pop: np.ndarray,
 ) -> bool:
-    if float(metrics.get("nfes_max", 0.0)) < ENHANCEMENT_MIN_NFES:
+    if elite_pop.size == 0:
         return False
-    if elite_pop.size == 0 or metrics["progress"] < LOCAL_REFINE_START_PROGRESS:
-        return False
-    cooldown_nfes = int(round(LOCAL_REFINE_COOLDOWN * state.nfes_max))
+    cooldown_nfes = LOCAL_REFINE_COOLDOWN_GENERATIONS * max(state.np_g, 1)
     if state.nfes - last_refine_nfes < max(cooldown_nfes, state.np_g):
         return False
-    return (
-        metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
-        and metrics["fitness_diversity"] <= LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD
+    collapsed = (
+        metrics["fitness_diversity"] <= LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD
         and metrics["decision_diversity"] <= LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD
+    )
+    ineffective = (
+        float(metrics.get("recent_accept_rate", 1.0)) <= LOCAL_REFINE_LOW_ACCEPT_RATE
+        and float(metrics.get("stagnation_generations", 0.0)) >= LOCAL_REFINE_STALL_GENERATIONS
+    )
+    return _state_enhancements_active(metrics) and (
+        metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
+        and (collapsed or ineffective)
     )
 
 
@@ -768,9 +842,9 @@ def local_refine_elite(
         return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty, False
 
     n_trials = max(1, min(LOCAL_REFINE_MAX_TRIALS, state.np_g // 4, remaining_budget))
-    progress = metrics["progress"]
-    sigma_ratio = LOCAL_REFINE_SIGMA_FINAL + (LOCAL_REFINE_SIGMA_INITIAL - LOCAL_REFINE_SIGMA_FINAL) * (1.0 - progress)
-    diff_scale = LOCAL_REFINE_DIFF_FINAL + (LOCAL_REFINE_DIFF_INITIAL - LOCAL_REFINE_DIFF_FINAL) * (1.0 - progress)
+    state_weight = _state_enhancement_weight(metrics)
+    sigma_ratio = LOCAL_REFINE_SIGMA_MIN + (LOCAL_REFINE_SIGMA_MAX - LOCAL_REFINE_SIGMA_MIN) * state_weight
+    diff_scale = LOCAL_REFINE_DIFF_MIN + (LOCAL_REFINE_DIFF_MAX - LOCAL_REFINE_DIFF_MIN) * state_weight
     sigma = sigma_ratio * (pop_max - pop_min)
     target = elite_pop[0]
     candidates = np.empty((n_trials, pop.shape[1]))
@@ -821,37 +895,16 @@ def _protected_np_min(np_min: int, pop_dim: int) -> int:
     return max(int(np_min), int(round(MIN_NP_DIM_FACTOR * pop_dim)))
 
 
-def _force_shrink_target(metrics: dict[str, float] | None, np_min: int, pop_dim: int) -> int | None:
-    if metrics is None:
-        return None
-    if float(metrics.get("nfes_max", 0.0)) < ENHANCEMENT_MIN_NFES:
-        return None
-    progress = float(metrics.get("progress", 0.0))
-    stagnated = float(metrics.get("stagnation_score", 0.0)) >= FORCE_SHRINK_STAGNATION
-    if not stagnated:
-        return None
-    protected_min = _protected_np_min(np_min, pop_dim)
-    if progress >= FORCE_SHRINK_START_PROGRESS:
-        return protected_min
-    return None
-
-
 def _effective_np_min(
     np_min: int,
     pop_dim: int,
-    progress: float,
     enable_late_enhancements: bool,
-    nfes_max: int | None = None,
     metrics: dict[str, float] | None = None,
 ) -> int:
     if not enable_late_enhancements:
         return int(np_min)
     protected_min = _protected_np_min(np_min, pop_dim)
-    if nfes_max is not None and nfes_max < ENHANCEMENT_MIN_NFES:
-        return protected_min
-    if _force_shrink_target(metrics, np_min, pop_dim) is not None:
-        return protected_min
-    if metrics is not None and _late_enhancements_active(metrics):
+    if metrics is not None and _state_enhancements_active(metrics):
         stagnated = metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
         collapsed = (
             metrics["fitness_diversity"] <= LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD
@@ -869,51 +922,47 @@ def _adaptive_population_size(
     np_max: int,
     np_min: int,
     best_history: list[float] | None,
+    accept_rate_history: list[float] | None,
     evals: int,
     pop_dim: int,
     enable_late_enhancements: bool = True,
     metrics: dict[str, float] | None = None,
 ) -> int:
     if metrics is None:
-        metrics = _search_metrics(state, fitness, penalty, best_history, evals)
-    progress = metrics["progress"]
-    best_now = metrics["best_now"]
+        metrics = _search_metrics(state, fitness, penalty, best_history, evals, accept_rate_history=accept_rate_history)
     improve_rate = metrics["improve_rate"]
     stagnation_score = metrics["stagnation_score"]
     diversity_score = metrics["diversity_score"]
-    effective_min = _effective_np_min(np_min, pop_dim, progress, enable_late_enhancements, state.nfes_max, metrics)
-
-    if best_history is not None and np.isfinite(best_now):
-        best_history.append(best_now)
+    effective_min = _effective_np_min(np_min, pop_dim, enable_late_enhancements, metrics)
 
     improvement_score = float(np.clip(improve_rate / ADAPTIVE_NP_IMPROVE_TARGET, 0.0, 1.0))
-    alpha = 1.2 + improvement_score
-    base_np = np_min + (np_max - np_min) * (1.0 - progress) ** alpha
-
+    recent_accept = float(metrics.get("recent_accept_rate", 1.0))
+    current_np = max(int(state.np_g), 1)
     need_explore = float(np.clip(stagnation_score * diversity_score, 0.0, 1.0))
     need_injection = float(np.clip(stagnation_score * (1.0 - diversity_score), 0.0, 1.0))
-    late_decay = 1.0 - progress
-    boost = (np_max - base_np) * late_decay * (
-        ADAPTIVE_NP_EXPLORE_BOOST * need_explore
-        + ADAPTIVE_NP_COLLAPSE_BOOST * need_injection
-    )
-    new_np = int(round(base_np + boost))
 
-    if stagnation_score > 0.8 and progress < 0.95:
+    if _state_enhancements_active(metrics):
+        growth = 1.0 + ADAPTIVE_NP_EXPLORE_BOOST * need_explore + ADAPTIVE_NP_COLLAPSE_BOOST * need_injection
+        if recent_accept <= STATE_ENHANCEMENT_LOW_ACCEPT_RATE:
+            growth += 0.08
+        new_np = max(current_np, int(round(current_np * growth)))
+    elif improvement_score > 0.5 and recent_accept > STATE_ENHANCEMENT_LOW_ACCEPT_RATE:
+        shrink_ratio = ADAPTIVE_NP_SLOW_SHRINK_RATIO if diversity_score > 0.5 else 0.98
+        new_np = int(round(current_np * shrink_ratio))
+    else:
+        new_np = current_np
+
+    if stagnation_score > 0.8:
         slow_shrink_ratio = max(
             ADAPTIVE_NP_MIN_SLOW_SHRINK_RATIO,
-            ADAPTIVE_NP_SLOW_SHRINK_RATIO - 0.4 * progress,
+            ADAPTIVE_NP_SLOW_SHRINK_RATIO - 0.2 * (1.0 - diversity_score),
         )
         slow_shrink_np = int(round(slow_shrink_ratio * state.np_g))
         if diversity_score > 0.5:
             new_np = max(new_np, slow_shrink_np)
         elif need_injection > 0.8:
-            injection = max(1, int(round(0.02 * np_max * late_decay)))
+            injection = max(1, int(round(0.02 * np_max)))
             new_np = max(new_np, slow_shrink_np + injection)
-
-    force_target = _force_shrink_target(metrics, np_min, pop_dim)
-    if force_target is not None:
-        new_np = min(new_np, force_target)
 
     return int(np.clip(new_np, effective_min, np_max))
 
@@ -939,17 +988,17 @@ def num_pop_update(
     pbest_fitness: np.ndarray,
     pbest_penalty: np.ndarray,
     best_history: list[float] | None = None,
+    accept_rate_history: list[float] | None = None,
     enable_late_enhancements: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    np_metrics = _search_metrics(state, fitness, penalty, best_history, evals, pop, pop_min, pop_max, accept_rate_history)
+    best_now = float(np_metrics.get("best_now", float("inf")))
+    if best_history is not None and np.isfinite(best_now):
+        best_history.append(best_now)
+
     if num_method == CONSTANT_NP_METHOD:
         return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty
 
-    progress = state.nfes / max(state.nfes_max, 1)
-    np_metrics = (
-        _search_metrics(state, fitness, penalty, best_history, evals, pop, pop_min, pop_max)
-        if num_method == ADAPTIVE_NP_METHOD
-        else None
-    )
     if num_method == ADAPTIVE_NP_METHOD:
         new_np = _adaptive_population_size(
             state,
@@ -958,6 +1007,7 @@ def num_pop_update(
             np_max,
             np_min,
             best_history,
+            accept_rate_history,
             evals,
             pop.shape[1],
             enable_late_enhancements,
@@ -977,11 +1027,21 @@ def num_pop_update(
             ef_total = pop_feasi_ef + pop_ufeasi_ef
 
         ef_mean = ef_total / max(old_np - 1, 1)
-        new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + np.exp(-ef_mean)) + np_min)
+        ef_score = float(np.clip(ef_mean, 0.0, 1.0))
+        recent_accept = float(np_metrics.get("recent_accept_rate", 1.0))
+        if _state_enhancements_active(np_metrics):
+            growth = 1.05 + 0.10 * (1.0 - ef_score)
+            if recent_accept <= STATE_ENHANCEMENT_LOW_ACCEPT_RATE:
+                growth += 0.05
+            new_np = max(old_np, int(round(old_np * growth)))
+        elif ef_score > 0.5 and recent_accept > STATE_ENHANCEMENT_LOW_ACCEPT_RATE:
+            new_np = int(round(old_np * ADAPTIVE_NP_SLOW_SHRINK_RATIO))
+        else:
+            new_np = old_np
     else:
         raise ValueError(f"Unsupported population update method: {num_method}; supported methods are {SUPPORTED_NP_METHODS}")
 
-    effective_min = _effective_np_min(np_min, pop.shape[1], progress, enable_late_enhancements, state.nfes_max, np_metrics)
+    effective_min = _effective_np_min(np_min, pop.shape[1], enable_late_enhancements, np_metrics)
     state.np_g = int(np.clip(new_np, effective_min, np_max))
     row = fitness.size
     if state.np_g > row:
@@ -1121,10 +1181,8 @@ def run(
             pbest_penalty = penalty.copy()
 
             eps0 = float(np.max(penalty)) or 1.0
-            lamta = 6
-            p = 0.5
             pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
-                pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
+                pop, fitness, penalty, eps0, pop_pbest, pbest_fitness, pbest_penalty
             )
             pop_best = pop[0].copy()
             pop_best_fitness = float(fitness[0])
@@ -1152,6 +1210,7 @@ def run(
             )
             last_resample_nfes = -state.nfes_max
             last_refine_nfes = -state.nfes_max
+            accept_rate_history: list[float] = []
             reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
             memory_len = 5
@@ -1169,11 +1228,11 @@ def run(
                 f_values = np.zeros(state.np_g)
                 cr_values = np.zeros(state.np_g)
                 ftar_values = np.zeros(state.np_g)
-                eps = generate_epsilon(eps0, lamta, p, state)
-                metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
+                metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
+                eps = generate_epsilon(eps0, penalty, metrics)
                 best_before_iteration = metrics["best_now"]
                 role_labels = search_role_labels(fitness, penalty, metrics)
-                if enable_late_enhancements and _late_enhancements_active(metrics):
+                if enable_late_enhancements and _state_enhancements_active(metrics):
                     pbest_pool = build_pbest_pool(
                         pop,
                         fitness,
@@ -1230,6 +1289,7 @@ def run(
                 state.nfes += state.np_g + int(np.sum(inf_u != 0))
                 accepted_mask = scr != -1
                 accept_rate = float(np.mean(accepted_mask)) if accepted_mask.size else 0.0
+                accept_rate_history.append(accept_rate)
                 accepted_delta = delta_f[accepted_mask]
                 mean_delta_f = float(np.mean(accepted_delta)) if accepted_delta.size else 0.0
                 mean_f = float(np.mean(f_values)) if f_values.size else 0.0
@@ -1242,13 +1302,14 @@ def run(
                 pop = pop_next.copy()
                 fitness = pop_next_fitness.copy()
                 penalty = pop_next_penalty.copy()
+                sort_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
-                    pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
+                    pop, fitness, penalty, eps0, pop_pbest, pbest_fitness, pbest_penalty, sort_metrics
                 )
                 pop_best = pop[0].copy()
                 pop_best_fitness = float(fitness[0])
                 pop_worst_fitness = float(fitness[-1])
-                eps = generate_epsilon(eps0, lamta, p, state)
+                eps = generate_epsilon(eps0, penalty, sort_metrics)
                 pop_pbest, pbest_fitness, pbest_penalty = update_pop_pbest(pop, fitness, penalty, pop_pbest, pbest_fitness, pbest_penalty, eps)
                 elite_archive_pop, elite_archive_fitness, elite_archive_penalty = update_elite_archive(
                     elite_archive_pop,
@@ -1286,10 +1347,11 @@ def run(
                     pbest_fitness,
                     pbest_penalty,
                     best_fitness_history,
+                    accept_rate_history,
                     enable_late_enhancements,
                 )
                 did_resample = False
-                resample_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
+                resample_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 if enable_late_enhancements and should_resample_stagnated_tail(resample_metrics, state, last_resample_nfes, elite_archive_pop):
                     (
                         pop,
@@ -1323,8 +1385,8 @@ def run(
                         last_resample_nfes = state.nfes
                 did_refine = False
                 attempted_refine = False
-                refine_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
-                eps = generate_epsilon(eps0, lamta, p, state)
+                refine_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
+                eps = generate_epsilon(eps0, penalty, refine_metrics)
                 if enable_late_enhancements and should_local_refine(refine_metrics, state, last_refine_nfes, elite_archive_pop):
                     attempted_refine = True
                     (
@@ -1359,8 +1421,9 @@ def run(
                     if did_refine:
                         last_refine_nfes = state.nfes
                 population_size_process = append_population_size_record(population_size_process, state)
+                sort_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
-                    pop, fitness, penalty, eps0, lamta, p, pop_pbest, pbest_fitness, pbest_penalty, state
+                    pop, fitness, penalty, eps0, pop_pbest, pbest_fitness, pbest_penalty, sort_metrics
                 )
                 if did_resample or did_refine:
                     pop_pbest, pbest_fitness, pbest_penalty = update_pop_pbest(pop, fitness, penalty, pop_pbest, pbest_fitness, pbest_penalty, eps)
@@ -1378,7 +1441,7 @@ def run(
                     )
                     process = process_best_record(process, pop, fitness, penalty, state.nfes, evals, variant="opmwade")
                 current_best, current_fearate = best_and_fearate(pop, fitness, penalty, evals, variant="opmwade")
-                end_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
+                end_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 diagnostic_process = append_diagnostic_record(
                     diagnostic_process,
                     repeat_index,
