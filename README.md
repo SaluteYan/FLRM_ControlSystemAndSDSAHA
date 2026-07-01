@@ -56,7 +56,7 @@ Use `--max-nfes` for a quick smoke test:
 python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --max-nfes 1 --no-save
 ```
 
-OPMWADE defaults to population update method `8`, which keeps the population size unchanged. You can pass it explicitly when running comparison checks:
+OPMWADE defaults to population update method `7`, adaptive NP. The adaptive population floor is protected at `5D` for every problem. Use method `8` when you need a fixed-population comparison run:
 
 ```bash
 python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --opmwade-num-method 8
@@ -106,7 +106,7 @@ The requested experiment runner exposes the same DSI-C2oDE controls:
 conda run --no-capture-output -n algorithm_py_env python run_requested_experiments.py --workers 0 --dsi-max-surrogate-samples 512 --dsi-w-max 40
 ```
 
-`--max-nfes` limits real objective evaluations. For RND this includes the hidden finite-difference objective calls used for numerical gradients and Hessian terms.
+`--max-nfes` limits real objective evaluations. RND now uses a budgeted projected local-search step by default, so its RND and PSO/wavelet candidates are evaluated explicitly instead of spending most of the budget on hidden finite-difference gradients and Hessian terms.
 
 The script writes:
 

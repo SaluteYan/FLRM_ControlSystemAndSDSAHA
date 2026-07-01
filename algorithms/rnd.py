@@ -28,12 +28,28 @@ from .common import (
 
 
 PYTHON_INIT_DIR = WORKSPACE_ROOT / "init_data"
+RND_INITIAL_STEP_FRACTION = 0.22
+RND_FINAL_STEP_FRACTION = 0.035
+RND_MEMORY_DECAY = 0.88
+RND_DIVERSITY_THRESHOLD = 0.08
 
 
 def limit_range(z: np.ndarray, pop_max: np.ndarray, pop_min: np.ndarray, evals: int) -> np.ndarray:
     arr = np.asarray(z, dtype=float)
     clipped = np.minimum(np.maximum(arr, pop_min), pop_max)
     return enforce_problem21_coupling(clipped) if evals == 21 else clipped
+
+
+def problem_project(
+    z: np.ndarray,
+    evals: int,
+    pop_max: np.ndarray | None = None,
+    pop_min: np.ndarray | None = None,
+) -> np.ndarray:
+    arr = np.asarray(z, dtype=float)
+    if pop_max is not None and pop_min is not None:
+        return limit_range(arr, pop_max, pop_min, evals)
+    return enforce_problem21_coupling(arr) if evals == 21 else arr.copy()
 
 
 Perturbation = None | float | np.ndarray | Callable[[int, np.ndarray], np.ndarray]
@@ -73,9 +89,11 @@ def objective_for_evals(
     penalty_factor: float = 1e8,
     use_penalty: bool = True,
     state: EvalState | None = None,
+    pop_max: np.ndarray | None = None,
+    pop_min: np.ndarray | None = None,
 ) -> Callable[[np.ndarray], float]:
     def objective(x: np.ndarray) -> float:
-        xx = np.asarray(x, dtype=float)
+        xx = problem_project(x, evals, pop_max, pop_min)
         if use_penalty:
             return float(evaluate_with_penalty(xx, evals, penalty_factor, state=state)[2][0])
         _reserve_evaluations(state, 1)
@@ -211,7 +229,14 @@ def rnd_step(
     hessian_mode: HessianMode = "diagonal",
     state: EvalState | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    objective = objective_for_evals(evals, penalty_factor=penalty_factor, use_penalty=True, state=state)
+    objective = objective_for_evals(
+        evals,
+        penalty_factor=penalty_factor,
+        use_penalty=True,
+        state=state,
+        pop_max=pop_max,
+        pop_min=pop_min,
+    )
     z_line, z_trajectory, dt = neural_dynamics_solver(
         objective,
         a,
@@ -241,9 +266,118 @@ def update_pbest(
 ) -> tuple[np.ndarray, float, float, float]:
     z_fitness, z_penalty, z_values = evaluate_with_penalty(z_line, evals, penalty_factor, state=state)
     z_value = float(z_values[0])
-    if z_value < pbest_value:
+    if solution_better(
+        z_line,
+        float(z_fitness[0]),
+        float(z_penalty[0]),
+        z_value,
+        pop_pbest_index,
+        pbest_fitness,
+        pbest_penalty,
+        pbest_value,
+        evals,
+    ):
         return z_line.copy(), z_value, float(z_fitness[0]), float(z_penalty[0])
     return pop_pbest_index, pbest_value, pbest_fitness, pbest_penalty
+
+
+def solution_better(
+    candidate: np.ndarray,
+    candidate_fitness: float,
+    candidate_penalty: float,
+    candidate_value: float,
+    incumbent: np.ndarray,
+    incumbent_fitness: float,
+    incumbent_penalty: float,
+    incumbent_value: float,
+    evals: int,
+) -> bool:
+    candidate_feasible = bool(fearate_calculate(candidate, evals, np.array([candidate_penalty]))[0] > 0)
+    incumbent_feasible = bool(fearate_calculate(incumbent, evals, np.array([incumbent_penalty]))[0] > 0)
+    if candidate_feasible and incumbent_feasible:
+        return candidate_fitness < incumbent_fitness
+    if candidate_feasible != incumbent_feasible:
+        return candidate_feasible
+    if not np.isclose(candidate_penalty, incumbent_penalty):
+        return candidate_penalty < incumbent_penalty
+    return candidate_value < incumbent_value
+
+
+def candidate_better_mask(
+    candidate_pop: np.ndarray,
+    candidate_fitness: np.ndarray,
+    candidate_penalty: np.ndarray,
+    candidate_values: np.ndarray,
+    incumbent_pop: np.ndarray,
+    incumbent_fitness: np.ndarray,
+    incumbent_penalty: np.ndarray,
+    incumbent_values: np.ndarray,
+    evals: int,
+) -> np.ndarray:
+    candidate_feasible = fearate_calculate(candidate_pop, evals, candidate_penalty) > 0
+    incumbent_feasible = fearate_calculate(incumbent_pop, evals, incumbent_penalty) > 0
+    better = np.zeros(candidate_fitness.size, dtype=bool)
+
+    both_feasible = candidate_feasible & incumbent_feasible
+    better[both_feasible] = candidate_fitness[both_feasible] < incumbent_fitness[both_feasible]
+
+    candidate_only_feasible = candidate_feasible & ~incumbent_feasible
+    better[candidate_only_feasible] = True
+
+    both_infeasible = ~candidate_feasible & ~incumbent_feasible
+    if np.any(both_infeasible):
+        lower_penalty = candidate_penalty[both_infeasible] < incumbent_penalty[both_infeasible]
+        tied_penalty = np.isclose(candidate_penalty[both_infeasible], incumbent_penalty[both_infeasible])
+        lower_value = candidate_values[both_infeasible] < incumbent_values[both_infeasible]
+        better[both_infeasible] = lower_penalty | (tied_penalty & lower_value)
+
+    return better
+
+
+def apply_candidate_update(
+    candidate_pop: np.ndarray,
+    candidate_fitness: np.ndarray,
+    candidate_penalty: np.ndarray,
+    candidate_values: np.ndarray,
+    incumbent_pop: np.ndarray,
+    incumbent_fitness: np.ndarray,
+    incumbent_penalty: np.ndarray,
+    incumbent_values: np.ndarray,
+    evals: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    better = candidate_better_mask(
+        candidate_pop,
+        candidate_fitness,
+        candidate_penalty,
+        candidate_values,
+        incumbent_pop,
+        incumbent_fitness,
+        incumbent_penalty,
+        incumbent_values,
+        evals,
+    )
+    if np.any(better):
+        incumbent_pop[better] = candidate_pop[better]
+        incumbent_fitness[better] = candidate_fitness[better]
+        incumbent_penalty[better] = candidate_penalty[better]
+        incumbent_values[better] = candidate_values[better]
+    return incumbent_pop, incumbent_fitness, incumbent_penalty, incumbent_values, int(np.sum(better))
+
+
+def best_index_by_feasibility(
+    pop: np.ndarray,
+    fitness: np.ndarray,
+    penalty: np.ndarray,
+    values: np.ndarray,
+    evals: int,
+) -> int:
+    feasible = fearate_calculate(pop, evals, penalty) > 0
+    if np.any(feasible):
+        feasible_idx = np.flatnonzero(feasible)
+        return int(feasible_idx[np.argmin(fitness[feasible_idx])])
+    penalty_min = np.min(penalty)
+    tied = np.flatnonzero(np.isclose(penalty, penalty_min))
+    return int(tied[np.argmin(values[tied])])
 
 
 def update_gbest(
@@ -255,11 +389,79 @@ def update_gbest(
     gbest_value: float,
     gbest_fitness: float,
     gbest_penalty: float,
+    evals: int,
 ) -> tuple[np.ndarray, float, float, float]:
-    idx = int(np.argmin(pbest_values))
-    if pbest_values[idx] < gbest_value:
+    idx = best_index_by_feasibility(pop_pbest, pbest_fitness, pbest_penalty, pbest_values, evals)
+    if solution_better(
+        pop_pbest[idx],
+        float(pbest_fitness[idx]),
+        float(pbest_penalty[idx]),
+        float(pbest_values[idx]),
+        pop_gbest,
+        gbest_fitness,
+        gbest_penalty,
+        gbest_value,
+        evals,
+    ):
         return pop_pbest[idx].copy(), float(pbest_values[idx]), float(pbest_fitness[idx]), float(pbest_penalty[idx])
     return pop_gbest, gbest_value, gbest_fitness, gbest_penalty
+
+
+def normalized_diversity(
+    pop: np.ndarray,
+    reference: np.ndarray,
+    pop_max: np.ndarray,
+    pop_min: np.ndarray,
+) -> float:
+    span = np.maximum(pop_max - pop_min, 1e-12)
+    distances = np.linalg.norm((pop - reference.reshape(1, -1)) / span, axis=1)
+    return float(np.mean(distances) / np.sqrt(pop.shape[1]))
+
+
+def cap_normalized_step(direction: np.ndarray, max_norm: float) -> np.ndarray:
+    norms = np.linalg.norm(direction, axis=1, keepdims=True)
+    scale = np.minimum(1.0, max_norm / np.maximum(norms, 1e-12))
+    return direction * scale
+
+
+def budget_rnd_population_step(
+    pop: np.ndarray,
+    pop_pbest: np.ndarray,
+    pop_gbest: np.ndarray,
+    rnd_integral: np.ndarray,
+    iteration_index: int,
+    pop_max: np.ndarray,
+    pop_min: np.ndarray,
+    evals: int,
+    state: EvalState,
+    perturbation: Perturbation = None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    span = np.maximum(pop_max - pop_min, 1e-12)
+    progress = min(max(state.nfes / max(state.nfes_max, 1), 0.0), 1.0)
+    pbest_error = (pop_pbest - pop) / span
+    gbest_error = (pop_gbest.reshape(1, -1) - pop) / span
+    target_error = 0.65 * pbest_error + 0.35 * gbest_error
+    rnd_integral = RND_MEMORY_DECAY * rnd_integral + target_error
+
+    noise = np.random.normal(size=pop.shape)
+    noise_norm = np.linalg.norm(noise, axis=1, keepdims=True)
+    noise = noise / np.maximum(noise_norm, 1e-12)
+    diversity = normalized_diversity(pop, pop_gbest, pop_max, pop_min)
+    noise_weight = 0.16 * (1.0 - progress) + 0.035
+    if diversity < RND_DIVERSITY_THRESHOLD:
+        noise_weight *= 1.8
+
+    perturb = np.zeros_like(pop)
+    if perturbation is not None:
+        for i, row in enumerate(pop):
+            perturb[i] = perturbation_vector(perturbation, iteration_index, row)
+        perturb = perturb / span
+
+    direction = 0.70 * target_error + 0.18 * rnd_integral + noise_weight * noise + 0.05 * perturb
+    step_fraction = RND_FINAL_STEP_FRACTION + (RND_INITIAL_STEP_FRACTION - RND_FINAL_STEP_FRACTION) * (1.0 - progress)
+    direction = cap_normalized_step(direction, step_fraction * np.sqrt(pop.shape[1]))
+    z_line = limit_range(pop + direction * span, pop_max, pop_min, evals)
+    return z_line, rnd_integral, step_fraction
 
 
 def generate_next_generation(
@@ -287,12 +489,9 @@ def generate_next_generation(
     else:
         g = 10000
         gamma = np.exp((-np.log(g)) * (1 - state.nfes / state.nfes_max) ** 2) + np.log(g)
-        f = gamma * (-2.5 + 5 * np.random.rand())
+        f = gamma * (-2.5 + 5 * np.random.rand(*pop.shape))
         c3 = 1 / np.sqrt(gamma) * np.exp(-(f / gamma) ** 2 / 2) * np.cos(kappa * f / gamma)
-        if c3 > 0:
-            pop_new = pop + c3 * (pop_max - pop)
-        else:
-            pop_new = pop + c3 * (pop - pop_min)
+        pop_new = np.where(c3 > 0, pop + c3 * (pop_max - pop), pop + c3 * (pop - pop_min))
     return limit_range(pop_new, pop_max, pop_min, evals)
 
 
@@ -381,81 +580,74 @@ def run(
                 init_data_dir=init_data_dir or PYTHON_INIT_DIR,
                 init_file=init_file,
             )
-            pop_next = np.zeros_like(pop)
             penalty_factor = 1e8
-            pbest_fitness, pbest_penalty, pbest_values = evaluate_with_penalty(pop, evals, penalty_factor, state=state)
+            pop_fitness, pop_penalty, pop_values = evaluate_with_penalty(pop, evals, penalty_factor, state=state)
             pop_pbest = pop.copy()
-            idx = int(np.argmin(pbest_values))
+            pbest_fitness = pop_fitness.copy()
+            pbest_penalty = pop_penalty.copy()
+            pbest_values = pop_values.copy()
+            idx = best_index_by_feasibility(pop_pbest, pbest_fitness, pbest_penalty, pbest_values, evals)
             pop_gbest = pop[idx].copy()
             gbest_value = float(pbest_values[idx])
             gbest_fitness = float(pbest_fitness[idx])
             gbest_penalty = float(pbest_penalty[idx])
             process = process_record(process, pop_gbest, gbest_fitness, gbest_penalty, state.nfes, evals)
             current_best = float(process[-1, 0]) if process.size else None
-            reporter.maybe(state, best=current_best, extra={"iter": 0, "np": state.np_g})
+            _, current_fearate = evaluated_best_and_fearate(pop_pbest, pbest_fitness, pbest_penalty, evals)
+            reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
-            c1 = 2
-            c2 = 2
+            c1 = 1.6
+            c2 = 1.6
             tar1 = 1
             tar2 = 1
-            w = 0.6
-            a = 100
-            b = 100
-            dt = 0.01
-            ita_line = 0.5
-            iteration_index = 1
-            trajectory_len = int(np.ceil(state.nfes_max / np_g)) + 2
-            z_trajectory = np.zeros((np_g, trajectory_len, pop_dim))
-            z_trajectory[:, 0, :] = pop
-            z_line = np.zeros_like(pop)
-            budget_exhausted = False
+            w_initial = 0.72
+            w_final = 0.35
+            ita_line = RND_DIVERSITY_THRESHOLD
+            iteration_index = 0
+            rnd_integral = np.zeros_like(pop)
 
             while state.nfes < state.nfes_max:
-                iteration_index += 1
-                dt_generated = np.full(np_g, dt)
-                processed_count = 0
-                for i in range(np_g):
-                    if state.nfes >= state.nfes_max:
-                        budget_exhausted = True
-                        break
-                    try:
-                        z_line[i], z_trajectory[i], dt_generated[i] = rnd_step(
-                            a,
-                            b,
-                            evals,
-                            z_trajectory[i],
-                            pop[i],
-                            iteration_index,
-                            dt,
-                            pop_max,
-                            pop_min,
-                            penalty_factor=penalty_factor,
-                            perturbation=perturbation,
-                            hessian_mode=hessian_mode,
-                            state=state,
-                        )
-                        (
-                            pop_pbest[i],
-                            pbest_values[i],
-                            pbest_fitness[i],
-                            pbest_penalty[i],
-                        ) = update_pbest(
-                            z_line[i],
-                            pop_pbest[i],
-                            pbest_values[i],
-                            pbest_fitness[i],
-                            pbest_penalty[i],
-                            evals,
-                            penalty_factor,
-                            state,
-                        )
-                    except EvaluationBudgetExhausted:
-                        budget_exhausted = True
-                        break
-                    processed_count += 1
-                if processed_count == 0:
+                if state.nfes_max - state.nfes < np_g:
                     break
-                dt = float(np.min(dt_generated[:processed_count]))
+                iteration_index += 1
+                z_line, rnd_integral, step_fraction = budget_rnd_population_step(
+                    pop,
+                    pop_pbest,
+                    pop_gbest,
+                    rnd_integral,
+                    iteration_index,
+                    pop_max,
+                    pop_min,
+                    evals,
+                    state,
+                    perturbation=perturbation,
+                )
+                try:
+                    z_fitness, z_penalty, z_values = evaluate_with_penalty(z_line, evals, penalty_factor, state=state)
+                except EvaluationBudgetExhausted:
+                    break
+                pop_pbest, pbest_fitness, pbest_penalty, pbest_values, local_pbest_updates = apply_candidate_update(
+                    z_line,
+                    z_fitness,
+                    z_penalty,
+                    z_values,
+                    pop_pbest,
+                    pbest_fitness,
+                    pbest_penalty,
+                    pbest_values,
+                    evals,
+                )
+                pop, pop_fitness, pop_penalty, pop_values, local_pop_updates = apply_candidate_update(
+                    z_line,
+                    z_fitness,
+                    z_penalty,
+                    z_values,
+                    pop,
+                    pop_fitness,
+                    pop_penalty,
+                    pop_values,
+                    evals,
+                )
                 pop_gbest, gbest_value, gbest_fitness, gbest_penalty = update_gbest(
                     pop_pbest,
                     pbest_values,
@@ -465,18 +657,102 @@ def run(
                     gbest_value,
                     gbest_fitness,
                     gbest_penalty,
+                    evals,
                 )
                 process = process_record(process, pop_gbest, gbest_fitness, gbest_penalty, state.nfes, evals)
                 current_best = float(process[-1, 0]) if process.size else None
+                _, current_fearate = evaluated_best_and_fearate(pop_pbest, pbest_fitness, pbest_penalty, evals)
                 reporter.maybe(
                     state,
                     best=current_best,
-                    extra={"iter": iteration_index, "np": state.np_g, "dt": f"{dt:.3g}"},
+                    fearate=current_fearate,
+                    extra={
+                        "iter": iteration_index,
+                        "np": state.np_g,
+                        "phase": "rnd",
+                        "step": f"{step_fraction:.3g}",
+                        "pbest+": local_pbest_updates,
+                        "pop+": local_pop_updates,
+                    },
                 )
-                ita = float(np.linalg.norm(z_line - pop_gbest) / np_g)
-                pop = generate_next_generation(pop, z_line, ita, ita_line, c1, c2, tar1, tar2, w, pop_pbest, pop_gbest, pop_max, pop_min, evals, state)
-                if budget_exhausted:
+
+                if state.nfes_max - state.nfes < np_g:
                     break
+
+                ita = normalized_diversity(pop, pop_gbest, pop_max, pop_min)
+                progress = min(max(state.nfes / max(state.nfes_max, 1), 0.0), 1.0)
+                w = w_final + (w_initial - w_final) * (1.0 - progress)
+                pop_candidate = generate_next_generation(
+                    pop,
+                    z_line,
+                    ita,
+                    ita_line,
+                    c1,
+                    c2,
+                    tar1,
+                    tar2,
+                    w,
+                    pop_pbest,
+                    pop_gbest,
+                    pop_max,
+                    pop_min,
+                    evals,
+                    state,
+                )
+                try:
+                    cand_fitness, cand_penalty, cand_values = evaluate_with_penalty(pop_candidate, evals, penalty_factor, state=state)
+                except EvaluationBudgetExhausted:
+                    break
+                pop, pop_fitness, pop_penalty, pop_values, gen_pop_updates = apply_candidate_update(
+                    pop_candidate,
+                    cand_fitness,
+                    cand_penalty,
+                    cand_values,
+                    pop,
+                    pop_fitness,
+                    pop_penalty,
+                    pop_values,
+                    evals,
+                )
+                pop_pbest, pbest_fitness, pbest_penalty, pbest_values, gen_pbest_updates = apply_candidate_update(
+                    pop_candidate,
+                    cand_fitness,
+                    cand_penalty,
+                    cand_values,
+                    pop_pbest,
+                    pbest_fitness,
+                    pbest_penalty,
+                    pbest_values,
+                    evals,
+                )
+                pop_gbest, gbest_value, gbest_fitness, gbest_penalty = update_gbest(
+                    pop_pbest,
+                    pbest_values,
+                    pbest_fitness,
+                    pbest_penalty,
+                    pop_gbest,
+                    gbest_value,
+                    gbest_fitness,
+                    gbest_penalty,
+                    evals,
+                )
+                process = process_record(process, pop_gbest, gbest_fitness, gbest_penalty, state.nfes, evals)
+                current_best = float(process[-1, 0]) if process.size else None
+                _, current_fearate = evaluated_best_and_fearate(pop_pbest, pbest_fitness, pbest_penalty, evals)
+                reporter.maybe(
+                    state,
+                    best=current_best,
+                    fearate=current_fearate,
+                    extra={
+                        "iter": iteration_index,
+                        "np": state.np_g,
+                        "phase": "pso" if ita > ita_line else "wavelet",
+                        "div": f"{ita:.3g}",
+                        "w": f"{w:.3g}",
+                        "pbest+": gen_pbest_updates,
+                        "pop+": gen_pop_updates,
+                    },
+                )
 
             best, fearate = evaluated_best_and_fearate(pop_pbest, pbest_fitness, pbest_penalty, evals)
             best_x, best_x_fit, best_x_pen = evaluated_best_individual(pop_pbest, pbest_fitness, pbest_penalty, evals)

@@ -373,14 +373,21 @@ def parse_args() -> argparse.Namespace:
         help="Folder for summary.csv, summary.json, and process arrays.",
     )
     parser.add_argument("--map-type", choices=["LD", "LS", "BD", "BS"], default="LD")
-    parser.add_argument("--rnd-hessian-mode", choices=["diagonal", "full"], default="diagonal")
+    parser.add_argument(
+        "--rnd-hessian-mode",
+        choices=["diagonal", "full"],
+        default="diagonal",
+        help="RND legacy finite-difference Hessian mode; the default black-box RND path uses budgeted projected local search.",
+    )
     parser.add_argument(
         "--opmwade-num-method",
         type=int,
-        default=opmwade.CONSTANT_NP_METHOD,
+        default=opmwade.ADAPTIVE_NP_METHOD,
         help=(
             "OPMWADE only: population-size update method. "
-            f"Use {opmwade.CONSTANT_NP_METHOD} to keep the population size unchanged."
+            f"Default {opmwade.ADAPTIVE_NP_METHOD} uses adaptive NP; "
+            f"use {opmwade.CONSTANT_NP_METHOD} to keep the population size unchanged. "
+            f"Supported methods: {opmwade.SUPPORTED_NP_METHODS}."
         ),
     )
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N scheduled experiments.")
@@ -435,8 +442,8 @@ def main() -> None:
         raise SystemExit("--dsi-max-surrogate-samples must be >= 0.")
     if args.dsi_w_max < 1:
         raise SystemExit("--dsi-w-max must be >= 1.")
-    if args.opmwade_num_method < 1:
-        raise SystemExit("--opmwade-num-method must be >= 1.")
+    if args.opmwade_num_method not in opmwade.SUPPORTED_NP_METHODS:
+        raise SystemExit(f"--opmwade-num-method must be one of {opmwade.SUPPORTED_NP_METHODS}.")
     unique_runs = unique_experiments(experiments)
     workers = resolve_worker_count(args.workers, len(unique_runs))
     if args.save_algorithm_mat and workers > 1:

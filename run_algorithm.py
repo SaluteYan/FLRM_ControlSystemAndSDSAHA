@@ -78,7 +78,12 @@ def main() -> None:
         help="Problem 21 trajectory correction mode: none, fixed, or adaptive.",
     )
     parser.add_argument("--map-type", choices=["LD", "LS", "BD", "BS"], default="LD", help="EDA++ mapping mechanism.")
-    parser.add_argument("--rnd-hessian-mode", choices=["diagonal", "full"], default="diagonal")
+    parser.add_argument(
+        "--rnd-hessian-mode",
+        choices=["diagonal", "full"],
+        default="diagonal",
+        help="RND legacy finite-difference Hessian mode; the default black-box RND path uses budgeted projected local search.",
+    )
     parser.add_argument("--rnd-perturbation", default="none", help="RND only: none, constant:value, or uniform:min:max")
     parser.add_argument(
         "--progress-interval",
@@ -101,10 +106,12 @@ def main() -> None:
     parser.add_argument(
         "--opmwade-num-method",
         type=int,
-        default=opmwade.CONSTANT_NP_METHOD,
+        default=opmwade.ADAPTIVE_NP_METHOD,
         help=(
             "OPMWADE only: population-size update method. "
-            f"Use {opmwade.CONSTANT_NP_METHOD} to keep the population size unchanged."
+            f"Default {opmwade.ADAPTIVE_NP_METHOD} uses adaptive NP; "
+            f"use {opmwade.CONSTANT_NP_METHOD} to keep the population size unchanged. "
+            f"Supported methods: {opmwade.SUPPORTED_NP_METHODS}."
         ),
     )
     parser.add_argument(
@@ -143,8 +150,8 @@ def main() -> None:
         parser.error("--dsi-max-surrogate-samples must be >= 0.")
     if args.dsi_w_max < 1:
         parser.error("--dsi-w-max must be >= 1.")
-    if args.opmwade_num_method < 1:
-        parser.error("--opmwade-num-method must be >= 1.")
+    if args.opmwade_num_method not in opmwade.SUPPORTED_NP_METHODS:
+        parser.error(f"--opmwade-num-method must be one of {opmwade.SUPPORTED_NP_METHODS}.")
 
     evals_values = parse_evals(args.evals)
     if args.target_angle is not None:

@@ -27,8 +27,10 @@ from .common import (
 
 
 PYTHON_INIT_DIR = WORKSPACE_ROOT / "init_data"
+EF_ADAPTIVE_NP_METHOD = 6
 ADAPTIVE_NP_METHOD = 7
 CONSTANT_NP_METHOD = 8
+SUPPORTED_NP_METHODS = (EF_ADAPTIVE_NP_METHOD, ADAPTIVE_NP_METHOD, CONSTANT_NP_METHOD)
 ADAPTIVE_NP_LOOKBACK = 5
 ADAPTIVE_NP_IMPROVE_TARGET = 1e-3
 ADAPTIVE_NP_STAGNATION = 1e-4
@@ -38,26 +40,25 @@ ADAPTIVE_NP_EXPLORE_BOOST = 0.3
 ADAPTIVE_NP_COLLAPSE_BOOST = 0.1
 ADAPTIVE_NP_SLOW_SHRINK_RATIO = 0.95
 ADAPTIVE_NP_MIN_SLOW_SHRINK_RATIO = 0.6
-P21_MIN_NP_DIM_FACTOR = 2.5
-P21_MIN_NP_RELEASE_PROGRESS = 0.8
-P21_ENHANCEMENT_MIN_NFES = 4000
-P21_FORCE_SHRINK_START_PROGRESS = 0.32
-P21_FORCE_SHRINK_FINAL_PROGRESS = 0.50
-P21_FORCE_SHRINK_STAGNATION = 0.80
-P21_FORCE_SHRINK_DIM_FACTOR = 3.0
+INITIAL_NP_DIM_FACTOR = 18.0
+MIN_NP_DIM_FACTOR = 5.0
+ENHANCEMENT_MIN_NFES = 4000
+FORCE_SHRINK_START_PROGRESS = 0.32
+FORCE_SHRINK_STAGNATION = 0.80
 CONSTRAINT_AWARE_FTAR_METHOD = 4
 FTAR_MIN = 0.25
 FTAR_MAX = 0.75
 FTAR_INFEASIBLE_BOOST = 0.25
 FTAR_STAGNATION_MAX = 0.9
 FTAR_STAGNATION_BOOST = 0.1
+STANDARD_FTAR_METHOD = 3
+SUPPORTED_FTAR_METHODS = (STANDARD_FTAR_METHOD, CONSTRAINT_AWARE_FTAR_METHOD)
 SUCCESS_OBJECTIVE_WEIGHT = 1.0
 SUCCESS_PENALTY_WEIGHT = 0.25
 SUCCESS_OBJECTIVE_BASE = 0.5
 SUCCESS_OBJECTIVE_FEASIBLE_GAIN = 1.0
 SUCCESS_PENALTY_INFEASIBLE_GAIN = 1.0
 LATE_ENHANCEMENT_START_PROGRESS = 0.55
-P21_LATE_ENHANCEMENT_START_PROGRESS = 0.75
 PBEST_FRACTION = 0.15
 PBEST_MIN_COUNT = 4
 ELITE_ARCHIVE_SIZE_FACTOR = 2.0
@@ -78,6 +79,14 @@ LOCAL_REFINE_SIGMA_INITIAL = 0.012
 LOCAL_REFINE_SIGMA_FINAL = 0.0025
 LOCAL_REFINE_DIFF_INITIAL = 0.12
 LOCAL_REFINE_DIFF_FINAL = 0.03
+ROLE_EXPLOIT = 1
+ROLE_BALANCE = 2
+ROLE_EXPLORE = 3
+ROLE_EXPLOIT_FRACTION = 0.30
+ROLE_EXPLORE_FRACTION = 0.30
+ROLE_LATE_PROGRESS = 0.65
+ROLE_LOW_DIVERSITY_THRESHOLD = 0.02
+ROLE_STAGNATION_THRESHOLD = 0.80
 DIAGNOSTIC_COLUMNS = np.array(
     [
         "repeat",
@@ -204,12 +213,9 @@ def _search_metrics(
 def _late_enhancements_active(metrics: dict[str, float] | None) -> bool:
     if metrics is None:
         return False
-    if int(metrics.get("evals", 0.0)) == 21 and float(metrics.get("nfes_max", 0.0)) < P21_ENHANCEMENT_MIN_NFES:
+    if float(metrics.get("nfes_max", 0.0)) < ENHANCEMENT_MIN_NFES:
         return False
-    start_progress = LATE_ENHANCEMENT_START_PROGRESS
-    if int(metrics.get("evals", 0.0)) == 21:
-        start_progress = P21_LATE_ENHANCEMENT_START_PROGRESS
-    return float(metrics.get("progress", 0.0)) >= start_progress
+    return float(metrics.get("progress", 0.0)) >= LATE_ENHANCEMENT_START_PROGRESS
 
 
 def _robust_merit_ita(merit: np.ndarray) -> float:
@@ -271,7 +277,6 @@ def mutation_and_crossover_params(
     pop_penalty: np.ndarray,
     eps: float,
     ftar_method: int,
-    state: EvalState,
     metrics: dict[str, float] | None = None,
     enable_late_enhancements: bool = True,
 ) -> tuple[float, float, float]:
@@ -284,15 +289,7 @@ def mutation_and_crossover_params(
         f = _cauchy(float(mf[r]), 0.1)
     f = min(f, 1.0)
 
-    if ftar_method == 1:
-        tar = 0.2 + np.sin(np.pi / 6 * (1 + 2 * state.nfes / state.nfes_max))
-        ftar = min(tar * f, 1.0)
-    elif ftar_method == 2:
-        best = np.min(pop_fitness)
-        worst = np.max(pop_fitness)
-        ita = np.sum((pop_fitness - best) / (worst - best + 1e-8)) / max(pop_fitness.size - 1, 1)
-        ftar = float(np.exp(-ita))
-    elif ftar_method == 3:
+    if ftar_method == STANDARD_FTAR_METHOD:
         best = np.min(pop_fitness)
         worst = np.max(pop_fitness)
         ita = np.sum((pop_fitness - best) / (worst - best + 1e-8)) / pop_fitness.size
@@ -300,7 +297,7 @@ def mutation_and_crossover_params(
     elif ftar_method == CONSTRAINT_AWARE_FTAR_METHOD:
         ftar = constraint_aware_ftar(pop_fitness, pop_penalty, eps, metrics, enable_late_enhancements)
     else:
-        raise ValueError(f"Unsupported Ftar method: {ftar_method}")
+        raise ValueError(f"Unsupported Ftar method: {ftar_method}; supported methods are {SUPPORTED_FTAR_METHODS}")
     return f, ftar, cr
 
 
@@ -394,6 +391,47 @@ def choose_pbest_target(fallback: np.ndarray, pbest_pool: np.ndarray) -> np.ndar
     return pbest_pool[np.random.randint(pbest_pool.shape[0])]
 
 
+def search_role_labels(fitness: np.ndarray, penalty: np.ndarray, metrics: dict[str, float] | None = None) -> np.ndarray:
+    fitness = np.asarray(fitness, dtype=float).reshape(-1)
+    penalty = np.asarray(penalty, dtype=float).reshape(-1)
+    role_labels = np.full(fitness.shape, ROLE_BALANCE, dtype=int)
+    finite = np.isfinite(fitness) & np.isfinite(penalty)
+    if fitness.size == 0:
+        return role_labels
+
+    feasible_idx = np.flatnonzero(finite & (penalty <= 0))
+    if feasible_idx.size == 0:
+        role_labels[finite] = ROLE_EXPLORE
+        return role_labels
+
+    order = feasible_idx[np.argsort(fitness[feasible_idx], kind="stable")]
+    n_feasible = order.size
+    exploit_fraction = ROLE_EXPLOIT_FRACTION
+    explore_fraction = ROLE_EXPLORE_FRACTION
+    if metrics is not None:
+        progress = float(metrics.get("progress", 0.0))
+        decision_diversity = float(metrics.get("decision_diversity", 1.0))
+        stagnation_score = float(metrics.get("stagnation_score", 0.0))
+        if progress >= ROLE_LATE_PROGRESS:
+            exploit_fraction = max(0.15, exploit_fraction - 0.05)
+            explore_fraction = min(0.50, explore_fraction + 0.05)
+        if decision_diversity <= ROLE_LOW_DIVERSITY_THRESHOLD:
+            exploit_fraction = max(0.15, exploit_fraction - 0.10)
+            explore_fraction = min(0.55, explore_fraction + 0.15)
+        if stagnation_score >= ROLE_STAGNATION_THRESHOLD:
+            explore_fraction = min(0.60, explore_fraction + 0.10)
+
+    n_exploit = max(1, int(round(exploit_fraction * n_feasible)))
+    n_explore = max(1, int(round(explore_fraction * n_feasible))) if n_feasible > 1 else 0
+    n_exploit = min(n_exploit, n_feasible)
+    n_explore = min(n_explore, max(0, n_feasible - n_exploit))
+
+    role_labels[order[:n_exploit]] = ROLE_EXPLOIT
+    if n_explore > 0:
+        role_labels[order[-n_explore:]] = ROLE_EXPLORE
+    return role_labels
+
+
 def mutation_results(
     f: float,
     ftar: float,
@@ -403,6 +441,7 @@ def mutation_results(
     pop: np.ndarray,
     i: int,
     class_labels: np.ndarray,
+    role_labels: np.ndarray,
     evals: int,
     pop_max: np.ndarray,
     pop_min: np.ndarray,
@@ -410,17 +449,35 @@ def mutation_results(
 ) -> np.ndarray:
     p1_indices = np.flatnonzero(class_labels == 1)
     p2_indices = np.flatnonzero(class_labels == 2)
+    role = int(role_labels[i]) if role_labels.size else ROLE_BALANCE
 
     if class_labels[i] == 1:
-        r2 = _unique_indices(1, np_g, exclude=i)[0]
-        pop_p2 = pop[np.random.choice(p2_indices)] if p2_indices.size else pop[i]
-        pbest_target = choose_pbest_target(pop_best, pbest_pool)
-        v = pop[i] + f * (pbest_target - pop[i]) + ftar * (pop[r2] - pop_p2)
+        if role == ROLE_EXPLOIT:
+            r2 = _unique_indices(1, np_g, exclude=i)[0]
+            pop_p2 = pop[np.random.choice(p2_indices)] if p2_indices.size else pop[i]
+            pbest_target = choose_pbest_target(pop_best, pbest_pool)
+            v = pop[i] + f * (pbest_target - pop[i]) + ftar * (pop[r2] - pop_p2)
+        elif role == ROLE_EXPLORE:
+            r1, r2, r3, r4, r5 = _unique_indices(5, np_g, exclude=i)
+            v = pop[r1] + f * (pop[r2] - pop[r3]) + ftar * (pop[r4] - pop[r5])
+        else:
+            r1, r2 = _unique_indices(2, np_g, exclude=i)
+            pbest_target = choose_pbest_target(pop_pbest[i], pbest_pool)
+            v = pop[i] + f * (pbest_target - pop[i]) + ftar * (pop[r1] - pop[r2])
     elif class_labels[i] == 2:
-        r1 = _unique_indices(1, np_g, exclude=i)[0]
-        pop_p1 = pop[np.random.choice(p1_indices)] if p1_indices.size else pop[i]
-        pbest_target = choose_pbest_target(pop_pbest[i], pbest_pool)
-        v = pop[i] + f * (pbest_target - pop[i]) + ftar * (pop[r1] - pop_p1)
+        if role == ROLE_EXPLORE:
+            r1, r2, r3, r4 = _unique_indices(4, np_g, exclude=i)
+            feasible_anchor = pop[np.random.choice(p1_indices)] if p1_indices.size else pop[r1]
+            v = pop[i] + 0.5 * f * (feasible_anchor - pop[i]) + ftar * (pop[r2] - pop[r3]) + 0.5 * f * (pop[r1] - pop[r4])
+        elif role == ROLE_EXPLOIT:
+            r1 = _unique_indices(1, np_g, exclude=i)[0]
+            pop_p1 = pop[np.random.choice(p1_indices)] if p1_indices.size else pop[i]
+            pbest_target = choose_pbest_target(pop_pbest[i], pbest_pool)
+            v = pop[i] + f * (pbest_target - pop[i]) + ftar * (pop[r1] - pop_p1)
+        else:
+            r1, r2 = _unique_indices(2, np_g, exclude=i)
+            pbest_target = choose_pbest_target(pop_pbest[i], pbest_pool)
+            v = pop[i] + f * (pbest_target - pop[i]) + ftar * (pop[r1] - pop[r2])
     else:
         r1, r2, r3, r4 = _unique_indices(4, np_g, exclude=i)
         v = pop[i] + f * (pop[r1] - pop[r2]) + ftar * (pop[r3] - pop[r4])
@@ -674,9 +731,7 @@ def should_local_refine(
     last_refine_nfes: int,
     elite_pop: np.ndarray,
 ) -> bool:
-    if int(metrics.get("evals", 0.0)) != 21:
-        return False
-    if float(metrics.get("nfes_max", 0.0)) < P21_ENHANCEMENT_MIN_NFES:
+    if float(metrics.get("nfes_max", 0.0)) < ENHANCEMENT_MIN_NFES:
         return False
     if elite_pop.size == 0 or metrics["progress"] < LOCAL_REFINE_START_PROGRESS:
         return False
@@ -762,39 +817,40 @@ def _feasible_best(fitness: np.ndarray, penalty: np.ndarray) -> float:
     return float(np.min(feasible_fitness))
 
 
-def _p21_force_shrink_target(metrics: dict[str, float] | None, np_min: int, pop_dim: int) -> int | None:
+def _protected_np_min(np_min: int, pop_dim: int) -> int:
+    return max(int(np_min), int(round(MIN_NP_DIM_FACTOR * pop_dim)))
+
+
+def _force_shrink_target(metrics: dict[str, float] | None, np_min: int, pop_dim: int) -> int | None:
     if metrics is None:
         return None
-    if int(metrics.get("evals", 0.0)) != 21:
-        return None
-    if float(metrics.get("nfes_max", 0.0)) < P21_ENHANCEMENT_MIN_NFES:
+    if float(metrics.get("nfes_max", 0.0)) < ENHANCEMENT_MIN_NFES:
         return None
     progress = float(metrics.get("progress", 0.0))
-    stagnated = float(metrics.get("stagnation_score", 0.0)) >= P21_FORCE_SHRINK_STAGNATION
+    stagnated = float(metrics.get("stagnation_score", 0.0)) >= FORCE_SHRINK_STAGNATION
     if not stagnated:
         return None
-    if progress >= P21_FORCE_SHRINK_FINAL_PROGRESS:
-        return int(np_min)
-    if progress >= P21_FORCE_SHRINK_START_PROGRESS:
-        return max(int(np_min), int(round(P21_FORCE_SHRINK_DIM_FACTOR * pop_dim)))
+    protected_min = _protected_np_min(np_min, pop_dim)
+    if progress >= FORCE_SHRINK_START_PROGRESS:
+        return protected_min
     return None
 
 
 def _effective_np_min(
     np_min: int,
     pop_dim: int,
-    evals: int,
     progress: float,
     enable_late_enhancements: bool,
     nfes_max: int | None = None,
     metrics: dict[str, float] | None = None,
 ) -> int:
-    if not enable_late_enhancements or evals != 21:
+    if not enable_late_enhancements:
         return int(np_min)
-    if nfes_max is not None and nfes_max < P21_ENHANCEMENT_MIN_NFES:
-        return int(np_min)
-    if _p21_force_shrink_target(metrics, np_min, pop_dim) is not None:
-        return int(np_min)
+    protected_min = _protected_np_min(np_min, pop_dim)
+    if nfes_max is not None and nfes_max < ENHANCEMENT_MIN_NFES:
+        return protected_min
+    if _force_shrink_target(metrics, np_min, pop_dim) is not None:
+        return protected_min
     if metrics is not None and _late_enhancements_active(metrics):
         stagnated = metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
         collapsed = (
@@ -802,12 +858,8 @@ def _effective_np_min(
             and metrics["decision_diversity"] <= LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD
         )
         if stagnated and collapsed:
-            return int(np_min)
-    protected_min = max(int(np_min), int(round(P21_MIN_NP_DIM_FACTOR * pop_dim)))
-    if progress <= P21_MIN_NP_RELEASE_PROGRESS:
-        return protected_min
-    release = float(np.clip((progress - P21_MIN_NP_RELEASE_PROGRESS) / (1.0 - P21_MIN_NP_RELEASE_PROGRESS), 0.0, 1.0))
-    return int(round((1.0 - release) * protected_min + release * np_min))
+            return protected_min
+    return protected_min
 
 
 def _adaptive_population_size(
@@ -829,7 +881,7 @@ def _adaptive_population_size(
     improve_rate = metrics["improve_rate"]
     stagnation_score = metrics["stagnation_score"]
     diversity_score = metrics["diversity_score"]
-    effective_min = _effective_np_min(np_min, pop_dim, evals, progress, enable_late_enhancements, state.nfes_max, metrics)
+    effective_min = _effective_np_min(np_min, pop_dim, progress, enable_late_enhancements, state.nfes_max, metrics)
 
     if best_history is not None and np.isfinite(best_now):
         best_history.append(best_now)
@@ -859,7 +911,7 @@ def _adaptive_population_size(
             injection = max(1, int(round(0.02 * np_max * late_decay)))
             new_np = max(new_np, slow_shrink_np + injection)
 
-    force_target = _p21_force_shrink_target(metrics, np_min, pop_dim)
+    force_target = _force_shrink_target(metrics, np_min, pop_dim)
     if force_target is not None:
         new_np = min(new_np, force_target)
 
@@ -889,7 +941,6 @@ def num_pop_update(
     best_history: list[float] | None = None,
     enable_late_enhancements: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    old_np = state.np_g
     if num_method == CONSTANT_NP_METHOD:
         return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty
 
@@ -912,7 +963,8 @@ def num_pop_update(
             enable_late_enhancements,
             np_metrics,
         )
-    else:
+    elif num_method == EF_ADAPTIVE_NP_METHOD:
+        old_np = state.np_g
         feasible_count = int(np.sum(penalty <= 0))
         if feasible_count == 0:
             ef_total = abs(np.sum((penalty - penalty[0]) / (penalty[-1] - penalty[0] - 1e-8)))
@@ -925,22 +977,11 @@ def num_pop_update(
             ef_total = pop_feasi_ef + pop_ufeasi_ef
 
         ef_mean = ef_total / max(old_np - 1, 1)
-        if num_method == 1:
-            new_np = round((np_max - np_min) * ef_mean ** max(state.nfes, 1) + np_min)
-        elif num_method == 2:
-            new_np = round((np_max - np_min) * np.random.rand() + np_min)
-        elif num_method == 3:
-            new_np = round((np_max - np_min) * np.random.rand() * ef_mean + np_min)
-        elif num_method == 4:
-            new_np = round((np_max - np_min) * (progress - 1) ** 2 + np_min)
-        elif num_method == 5:
-            new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + ef_mean) + np_min)
-        elif num_method == 6:
-            new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + np.exp(-ef_mean)) + np_min)
-        else:
-            raise ValueError(f"Unsupported population update method: {num_method}")
+        new_np = round((np_max - np_min) * abs(progress - 1) ** (1 + np.exp(-ef_mean)) + np_min)
+    else:
+        raise ValueError(f"Unsupported population update method: {num_method}; supported methods are {SUPPORTED_NP_METHODS}")
 
-    effective_min = _effective_np_min(np_min, pop.shape[1], evals, progress, enable_late_enhancements, state.nfes_max, np_metrics)
+    effective_min = _effective_np_min(np_min, pop.shape[1], progress, enable_late_enhancements, state.nfes_max, np_metrics)
     state.np_g = int(np.clip(new_np, effective_min, np_max))
     row = fitness.size
     if state.np_g > row:
@@ -1028,7 +1069,7 @@ def run(
     seed: int | None = None,
     max_nfes: int | None = None,
     save: bool = True,
-    num_method: int = CONSTANT_NP_METHOD,
+    num_method: int = ADAPTIVE_NP_METHOD,
     ftar_method: int = CONSTRAINT_AWARE_FTAR_METHOD,
     init_data_dir: str | None = None,
     init_file: str | None = None,
@@ -1059,8 +1100,8 @@ def run(
             pop_max, pop_min, pop_dim = set_initial_scope(evals)
             state = EvalState(nfes=0, nfes_max=max_nfes or iteration_setting(evals, pop_dim))
             reporter = ProgressReporter("OPMWADE", evals, repeat_index, repeat_num, progress_interval, progress_label)
-            np_init = 10 * pop_dim if evals == 21 else 18 * pop_dim
-            np_min = 2 * pop_dim
+            np_init = max(1, int(round(INITIAL_NP_DIM_FACTOR * pop_dim)))
+            np_min = max(1, int(round(MIN_NP_DIM_FACTOR * pop_dim)))
             np_max = np_init
             state.np_g = np_init
 
@@ -1131,6 +1172,7 @@ def run(
                 eps = generate_epsilon(eps0, lamta, p, state)
                 metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max)
                 best_before_iteration = metrics["best_now"]
+                role_labels = search_role_labels(fitness, penalty, metrics)
                 if enable_late_enhancements and _late_enhancements_active(metrics):
                     pbest_pool = build_pbest_pool(
                         pop,
@@ -1154,14 +1196,13 @@ def run(
                         penalty,
                         eps,
                         ftar_method,
-                        state,
                         metrics,
                         enable_late_enhancements,
                     )
                     f_values[i] = f
                     cr_values[i] = cr
                     ftar_values[i] = ftar
-                    v = mutation_results(f, ftar, pop_best, pop_pbest, pbest_pool, pop, i, class_labels, evals, pop_max, pop_min, state.np_g)
+                    v = mutation_results(f, ftar, pop_best, pop_pbest, pbest_pool, pop, i, class_labels, role_labels, evals, pop_max, pop_min, state.np_g)
                     u = crossover(pop[i], v, cr, pop_max, pop_min, evals)
                     u_fitness, u_penalty, u_inf = get_fitness_and_penalty(u, evals, opmwade_repair_inf=True)
                     inf_u[i] = u_inf[0]
