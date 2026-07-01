@@ -69,6 +69,7 @@ class RunnerOptions:
     save_algorithm_mat: bool
     map_type: str
     rnd_hessian_mode: str
+    opmwade_num_method: int
     progress_interval: int
     dsi_max_surrogate_samples: int
     dsi_w_max: int
@@ -113,6 +114,7 @@ def runner_options_from_args(args: argparse.Namespace) -> RunnerOptions:
         save_algorithm_mat=args.save_algorithm_mat,
         map_type=args.map_type,
         rnd_hessian_mode=args.rnd_hessian_mode,
+        opmwade_num_method=args.opmwade_num_method,
         progress_interval=args.progress_interval,
         dsi_max_surrogate_samples=args.dsi_max_surrogate_samples,
         dsi_w_max=args.dsi_w_max,
@@ -147,6 +149,8 @@ def runner_kwargs(experiment: Experiment, options: RunnerOptions, init_file: Pat
     if experiment.algorithm == "dsi-c2ode":
         kwargs["max_surrogate_samples"] = options.dsi_max_surrogate_samples
         kwargs["w_max"] = options.dsi_w_max
+    if experiment.algorithm == "opmwade":
+        kwargs["num_method"] = options.opmwade_num_method
     return kwargs
 
 
@@ -370,6 +374,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--map-type", choices=["LD", "LS", "BD", "BS"], default="LD")
     parser.add_argument("--rnd-hessian-mode", choices=["diagonal", "full"], default="diagonal")
+    parser.add_argument(
+        "--opmwade-num-method",
+        type=int,
+        default=opmwade.CONSTANT_NP_METHOD,
+        help=(
+            "OPMWADE only: population-size update method. "
+            f"Use {opmwade.CONSTANT_NP_METHOD} to keep the population size unchanged."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None, help="Run only the first N scheduled experiments.")
     parser.add_argument(
         "--workers",
@@ -422,6 +435,8 @@ def main() -> None:
         raise SystemExit("--dsi-max-surrogate-samples must be >= 0.")
     if args.dsi_w_max < 1:
         raise SystemExit("--dsi-w-max must be >= 1.")
+    if args.opmwade_num_method < 1:
+        raise SystemExit("--opmwade-num-method must be >= 1.")
     unique_runs = unique_experiments(experiments)
     workers = resolve_worker_count(args.workers, len(unique_runs))
     if args.save_algorithm_mat and workers > 1:

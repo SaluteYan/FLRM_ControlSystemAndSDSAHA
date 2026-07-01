@@ -56,6 +56,12 @@ Use `--max-nfes` for a quick smoke test:
 python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --max-nfes 1 --no-save
 ```
 
+OPMWADE defaults to population update method `8`, which keeps the population size unchanged. You can pass it explicitly when running comparison checks:
+
+```bash
+python run_algorithm.py --algorithm opmwade --evals 21 --damping-mode adaptive --target-angle 1.05 --tip-mass 0.00978 --opmwade-num-method 8
+```
+
 DSI-C2oDE uses a surrogate model and can become expensive when every evaluated
 sample is retained. The default run keeps the standard Problem 21 population
 size, bounds the surrogate archive, and caps the search intensity:

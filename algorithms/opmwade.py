@@ -28,6 +28,7 @@ from .common import (
 
 PYTHON_INIT_DIR = WORKSPACE_ROOT / "init_data"
 ADAPTIVE_NP_METHOD = 7
+CONSTANT_NP_METHOD = 8
 ADAPTIVE_NP_LOOKBACK = 5
 ADAPTIVE_NP_IMPROVE_TARGET = 1e-3
 ADAPTIVE_NP_STAGNATION = 1e-4
@@ -889,6 +890,9 @@ def num_pop_update(
     enable_late_enhancements: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     old_np = state.np_g
+    if num_method == CONSTANT_NP_METHOD:
+        return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty
+
     progress = state.nfes / max(state.nfes_max, 1)
     np_metrics = (
         _search_metrics(state, fitness, penalty, best_history, evals, pop, pop_min, pop_max)
@@ -1024,7 +1028,7 @@ def run(
     seed: int | None = None,
     max_nfes: int | None = None,
     save: bool = True,
-    num_method: int = ADAPTIVE_NP_METHOD,
+    num_method: int = CONSTANT_NP_METHOD,
     ftar_method: int = CONSTRAINT_AWARE_FTAR_METHOD,
     init_data_dir: str | None = None,
     init_file: str | None = None,

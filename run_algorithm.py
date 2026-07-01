@@ -99,6 +99,15 @@ def main() -> None:
         help="DSI-C2oDE only: maximum search intensity.",
     )
     parser.add_argument(
+        "--opmwade-num-method",
+        type=int,
+        default=opmwade.CONSTANT_NP_METHOD,
+        help=(
+            "OPMWADE only: population-size update method. "
+            f"Use {opmwade.CONSTANT_NP_METHOD} to keep the population size unchanged."
+        ),
+    )
+    parser.add_argument(
         "--init-data-root",
         default=None,
         help="Folder with shared PrG{evals}InitData files. Defaults to converted_python_algorithms/init_data.",
@@ -134,6 +143,8 @@ def main() -> None:
         parser.error("--dsi-max-surrogate-samples must be >= 0.")
     if args.dsi_w_max < 1:
         parser.error("--dsi-w-max must be >= 1.")
+    if args.opmwade_num_method < 1:
+        parser.error("--opmwade-num-method must be >= 1.")
 
     evals_values = parse_evals(args.evals)
     if args.target_angle is not None:
@@ -161,6 +172,8 @@ def main() -> None:
         if name == "dsi-c2ode":
             extra["max_surrogate_samples"] = args.dsi_max_surrogate_samples
             extra["w_max"] = args.dsi_w_max
+        if name == "opmwade":
+            extra["num_method"] = args.opmwade_num_method
         results = RUNNERS[name](
             evals_range=evals_values,
             repeat_num=args.repeat,
