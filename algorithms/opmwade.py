@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .common import (
@@ -64,6 +66,8 @@ STATE_ENHANCEMENT_STALL_GENERATIONS = 4
 STATE_ENHANCEMENT_LOW_ACCEPT_RATE = 0.12
 STATE_ENHANCEMENT_FITNESS_DIVERSITY = 0.16
 STATE_ENHANCEMENT_DECISION_DIVERSITY = 0.20
+POP_GROWTH_COOLDOWN_GENERATIONS = 4
+POP_GROWTH_IMPROVE_TOL = 1e-12
 STAGNATION_RESAMPLE_FRACTION = 0.3
 STAGNATION_RESAMPLE_THRESHOLD = 0.9
 STAGNATION_RESAMPLE_DIVERSITY = 0.06
@@ -76,7 +80,7 @@ LOCAL_REFINE_STAGNATION_THRESHOLD = 0.80
 LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD = 0.08
 LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD = 0.18
 LOCAL_REFINE_STALL_GENERATIONS = 4
-LOCAL_REFINE_LOW_ACCEPT_RATE = 0.08
+LOCAL_REFINE_LOW_ACCEPT_RATE = 0.12
 LOCAL_REFINE_COOLDOWN_GENERATIONS = 4
 LOCAL_REFINE_MAX_TRIALS = 4
 LOCAL_REFINE_SIGMA_MIN = 0.0025
@@ -111,6 +115,137 @@ DIAGNOSTIC_COLUMNS = np.array(
         "local_refine_accepted",
     ]
 )
+
+
+@dataclass
+class PopulationState:
+    pop: np.ndarray
+    fitness: np.ndarray
+    penalty: np.ndarray
+    pop_next: np.ndarray
+    next_fitness: np.ndarray
+    next_penalty: np.ndarray
+    pop_pbest: np.ndarray
+    pbest_fitness: np.ndarray
+    pbest_penalty: np.ndarray
+
+    def as_tuple(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        return (
+            self.pop,
+            self.fitness,
+            self.penalty,
+            self.pop_next,
+            self.next_fitness,
+            self.next_penalty,
+            self.pop_pbest,
+            self.pbest_fitness,
+            self.pbest_penalty,
+        )
+
+    def promote_next(self) -> None:
+        self.pop = self.pop_next.copy()
+        self.fitness = self.next_fitness.copy()
+        self.penalty = self.next_penalty.copy()
+
+    def set_current(self, pop: np.ndarray, fitness: np.ndarray, penalty: np.ndarray) -> None:
+        self.pop = pop
+        self.fitness = fitness
+        self.penalty = penalty
+
+    def set_pbest(self, pop_pbest: np.ndarray, pbest_fitness: np.ndarray, pbest_penalty: np.ndarray) -> None:
+        self.pop_pbest = pop_pbest
+        self.pbest_fitness = pbest_fitness
+        self.pbest_penalty = pbest_penalty
+
+    def replace_current_row(self, index: int, candidate: np.ndarray, fitness: float, penalty: float) -> None:
+        self.pop[index] = candidate
+        self.fitness[index] = fitness
+        self.penalty[index] = penalty
+        self.pop_next[index] = candidate
+        self.next_fitness[index] = fitness
+        self.next_penalty[index] = penalty
+
+    def replace_current_rows(self, indices: np.ndarray, candidates: np.ndarray, fitness: np.ndarray, penalty: np.ndarray) -> None:
+        self.pop[indices] = candidates
+        self.fitness[indices] = fitness
+        self.penalty[indices] = penalty
+        self.pop_next[indices] = candidates
+        self.next_fitness[indices] = fitness
+        self.next_penalty[indices] = penalty
+
+    def update_pbest_row_if_better(self, index: int, candidate: np.ndarray, fitness: float, penalty: float, eps: float) -> bool:
+        if not epsilon_better(fitness, penalty, self.pbest_fitness[index], self.pbest_penalty[index], eps):
+            return False
+        self.pop_pbest[index] = candidate
+        self.pbest_fitness[index] = fitness
+        self.pbest_penalty[index] = penalty
+        return True
+
+    def replace_row(self, index: int, candidate: np.ndarray, fitness: float, penalty: float) -> None:
+        self.replace_current_row(index, candidate, fitness, penalty)
+        self.pop_pbest[index] = candidate
+        self.pbest_fitness[index] = fitness
+        self.pbest_penalty[index] = penalty
+
+    def replace_rows(self, indices: np.ndarray, candidates: np.ndarray, fitness: np.ndarray, penalty: np.ndarray) -> None:
+        self.replace_current_rows(indices, candidates, fitness, penalty)
+        self.pop_pbest[indices] = candidates
+        self.pbest_fitness[indices] = fitness
+        self.pbest_penalty[indices] = penalty
+
+    def append(self, supplement: np.ndarray, fitness: np.ndarray, penalty: np.ndarray) -> None:
+        self.pop = np.vstack([self.pop, supplement])
+        self.fitness = np.concatenate([self.fitness, fitness])
+        self.penalty = np.concatenate([self.penalty, penalty])
+        self.pop_next = np.vstack([self.pop_next, supplement])
+        self.next_fitness = np.concatenate([self.next_fitness, fitness])
+        self.next_penalty = np.concatenate([self.next_penalty, penalty])
+        self.pop_pbest = np.vstack([self.pop_pbest, supplement])
+        self.pbest_fitness = np.concatenate([self.pbest_fitness, fitness])
+        self.pbest_penalty = np.concatenate([self.pbest_penalty, penalty])
+
+    def trim(self, count: int) -> None:
+        keep = slice(0, count)
+        self.pop = self.pop[keep]
+        self.fitness = self.fitness[keep]
+        self.penalty = self.penalty[keep]
+        self.pop_next = self.pop_next[keep]
+        self.next_fitness = self.next_fitness[keep]
+        self.next_penalty = self.next_penalty[keep]
+        self.pop_pbest = self.pop_pbest[keep]
+        self.pbest_fitness = self.pbest_fitness[keep]
+        self.pbest_penalty = self.pbest_penalty[keep]
+
+
+@dataclass
+class PopulationGrowthControl:
+    last_growth_generation: int = -10**9
+    growth_reference_best: float = float("inf")
+    awaiting_improvement: bool = False
+    growth_disabled: bool = False
+
+    def observe(self, generation: int, best_now: float) -> None:
+        if not self.awaiting_improvement:
+            return
+        if np.isfinite(best_now) and best_now < self.growth_reference_best - POP_GROWTH_IMPROVE_TOL:
+            self.awaiting_improvement = False
+            self.growth_reference_best = best_now
+            return
+        if generation - self.last_growth_generation >= POP_GROWTH_COOLDOWN_GENERATIONS:
+            self.awaiting_improvement = False
+            self.growth_disabled = True
+
+    def allow_growth(self, generation: int) -> bool:
+        if self.growth_disabled or self.awaiting_improvement:
+            return False
+        return generation - self.last_growth_generation >= POP_GROWTH_COOLDOWN_GENERATIONS
+
+    def record_growth(self, generation: int, best_now: float) -> None:
+        self.last_growth_generation = generation
+        self.growth_reference_best = best_now
+        self.awaiting_improvement = True
 
 
 def _cauchy(mu: float, gamma: float) -> float:
@@ -747,25 +882,18 @@ def should_resample_stagnated_tail(
 
 
 def resample_stagnated_tail(
-    pop: np.ndarray,
-    fitness: np.ndarray,
-    penalty: np.ndarray,
-    pop_next: np.ndarray,
-    next_fitness: np.ndarray,
-    next_penalty: np.ndarray,
-    pop_pbest: np.ndarray,
-    pbest_fitness: np.ndarray,
-    pbest_penalty: np.ndarray,
+    population: PopulationState,
     elite_pop: np.ndarray,
     pop_max: np.ndarray,
     pop_min: np.ndarray,
     evals: int,
+    eps: float,
     state: EvalState,
     metrics: dict[str, float],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+) -> bool:
     remaining_budget = max(state.nfes_max - state.nfes, 0)
     if remaining_budget <= 0 or elite_pop.size == 0:
-        return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty, False
+        return False
 
     n_resample = int(round(STAGNATION_RESAMPLE_FRACTION * state.np_g))
     n_resample = max(1, min(n_resample, state.np_g - 1, remaining_budget))
@@ -775,23 +903,23 @@ def resample_stagnated_tail(
     diversity_gap = 1.0 - float(np.clip(metrics.get("decision_diversity", 1.0) / STATE_ENHANCEMENT_DECISION_DIVERSITY, 0.0, 1.0))
     sigma_ratio = STAGNATION_RESAMPLE_SIGMA_MIN + (STAGNATION_RESAMPLE_SIGMA_MAX - STAGNATION_RESAMPLE_SIGMA_MIN) * max(state_weight, diversity_gap)
     sigma = sigma_ratio * (pop_max - pop_min)
-    candidates = elite_pop[elite_idx] + np.random.normal(0.0, sigma, size=(n_resample, pop.shape[1]))
+    candidates = elite_pop[elite_idx] + np.random.normal(0.0, sigma, size=(n_resample, population.pop.shape[1]))
     candidates = np.minimum(np.maximum(candidates, pop_min), pop_max)
     if evals == 21:
         candidates = enforce_problem21_coupling(candidates)
 
     cand_fitness, cand_penalty, inf_flags = get_fitness_and_penalty(candidates, evals, opmwade_repair_inf=True)
     state.nfes += n_resample + int(np.sum(inf_flags != 0))
-    pop[replace_idx] = candidates
-    fitness[replace_idx] = cand_fitness
-    penalty[replace_idx] = cand_penalty
-    pop_next[replace_idx] = candidates
-    next_fitness[replace_idx] = cand_fitness
-    next_penalty[replace_idx] = cand_penalty
-    pop_pbest[replace_idx] = candidates
-    pbest_fitness[replace_idx] = cand_fitness
-    pbest_penalty[replace_idx] = cand_penalty
-    return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty, True
+    population.replace_current_rows(replace_idx, candidates, cand_fitness, cand_penalty)
+    for local_idx, dst in enumerate(replace_idx):
+        population.update_pbest_row_if_better(
+            int(dst),
+            candidates[local_idx],
+            float(cand_fitness[local_idx]),
+            float(cand_penalty[local_idx]),
+            eps,
+        )
+    return True
 
 
 def should_local_refine(
@@ -807,28 +935,20 @@ def should_local_refine(
         return False
     collapsed = (
         metrics["fitness_diversity"] <= LOCAL_REFINE_FITNESS_DIVERSITY_THRESHOLD
-        and metrics["decision_diversity"] <= LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD
+        or metrics["decision_diversity"] <= LOCAL_REFINE_DECISION_DIVERSITY_THRESHOLD
     )
     ineffective = (
         float(metrics.get("recent_accept_rate", 1.0)) <= LOCAL_REFINE_LOW_ACCEPT_RATE
         and float(metrics.get("stagnation_generations", 0.0)) >= LOCAL_REFINE_STALL_GENERATIONS
     )
     return _state_enhancements_active(metrics) and (
-        metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD
-        and (collapsed or ineffective)
+        ineffective
+        or (metrics["stagnation_score"] >= LOCAL_REFINE_STAGNATION_THRESHOLD and collapsed)
     )
 
 
 def local_refine_elite(
-    pop: np.ndarray,
-    fitness: np.ndarray,
-    penalty: np.ndarray,
-    pop_next: np.ndarray,
-    next_fitness: np.ndarray,
-    next_penalty: np.ndarray,
-    pop_pbest: np.ndarray,
-    pbest_fitness: np.ndarray,
-    pbest_penalty: np.ndarray,
+    population: PopulationState,
     elite_pop: np.ndarray,
     pop_max: np.ndarray,
     pop_min: np.ndarray,
@@ -836,10 +956,10 @@ def local_refine_elite(
     eps: float,
     state: EvalState,
     metrics: dict[str, float],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+) -> bool:
     remaining_budget = max(state.nfes_max - state.nfes, 0)
     if remaining_budget <= 0 or elite_pop.size == 0:
-        return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty, False
+        return False
 
     n_trials = max(1, min(LOCAL_REFINE_MAX_TRIALS, state.np_g // 4, remaining_budget))
     state_weight = _state_enhancement_weight(metrics)
@@ -847,7 +967,7 @@ def local_refine_elite(
     diff_scale = LOCAL_REFINE_DIFF_MIN + (LOCAL_REFINE_DIFF_MAX - LOCAL_REFINE_DIFF_MIN) * state_weight
     sigma = sigma_ratio * (pop_max - pop_min)
     target = elite_pop[0]
-    candidates = np.empty((n_trials, pop.shape[1]))
+    candidates = np.empty((n_trials, population.pop.shape[1]))
 
     for row in range(n_trials):
         if elite_pop.shape[0] >= 3:
@@ -855,7 +975,7 @@ def local_refine_elite(
             diff = diff_scale * (elite_pop[r1] - elite_pop[r2])
         else:
             diff = 0.0
-        candidates[row] = target + diff + np.random.normal(0.0, sigma, size=pop.shape[1])
+        candidates[row] = target + diff + np.random.normal(0.0, sigma, size=population.pop.shape[1])
 
     candidates = np.minimum(np.maximum(candidates, pop_min), pop_max)
     if evals == 21:
@@ -868,20 +988,18 @@ def local_refine_elite(
     replace_idx = np.arange(state.np_g - n_trials, state.np_g)
     candidate_order = np.lexsort((cand_fitness, cand_penalty))
     for dst, src in zip(replace_idx, candidate_order):
-        if epsilon_better(cand_fitness[src], cand_penalty[src], fitness[dst], penalty[dst], eps):
-            candidate = candidates[src]
-            pop[dst] = candidate
-            fitness[dst] = cand_fitness[src]
-            penalty[dst] = cand_penalty[src]
-            pop_next[dst] = candidate
-            next_fitness[dst] = cand_fitness[src]
-            next_penalty[dst] = cand_penalty[src]
-            pop_pbest[dst] = candidate
-            pbest_fitness[dst] = cand_fitness[src]
-            pbest_penalty[dst] = cand_penalty[src]
+        if epsilon_better(cand_fitness[src], cand_penalty[src], population.fitness[dst], population.penalty[dst], eps):
+            population.replace_current_row(dst, candidates[src], float(cand_fitness[src]), float(cand_penalty[src]))
+            population.update_pbest_row_if_better(
+                int(dst),
+                candidates[src],
+                float(cand_fitness[src]),
+                float(cand_penalty[src]),
+                eps,
+            )
             accepted = True
 
-    return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty, accepted
+    return accepted
 
 
 def _feasible_best(fitness: np.ndarray, penalty: np.ndarray) -> float:
@@ -970,59 +1088,69 @@ def _adaptive_population_size(
 def num_pop_update(
     num_method: int,
     state: EvalState,
-    pop: np.ndarray,
-    fitness: np.ndarray,
+    population: PopulationState,
     pop_best_fitness: float,
     pop_worst_fitness: float,
     np_max: int,
     np_min: int,
     pop_max: np.ndarray,
     pop_min: np.ndarray,
-    pop_best: np.ndarray,
-    pop_next: np.ndarray,
     evals: int,
-    penalty: np.ndarray,
-    next_fitness: np.ndarray,
-    next_penalty: np.ndarray,
-    pop_pbest: np.ndarray,
-    pbest_fitness: np.ndarray,
-    pbest_penalty: np.ndarray,
     best_history: list[float] | None = None,
     accept_rate_history: list[float] | None = None,
     enable_late_enhancements: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    np_metrics = _search_metrics(state, fitness, penalty, best_history, evals, pop, pop_min, pop_max, accept_rate_history)
+    growth_control: PopulationGrowthControl | None = None,
+    generation_index: int = 0,
+) -> PopulationState:
+    np_metrics = _search_metrics(
+        state,
+        population.fitness,
+        population.penalty,
+        best_history,
+        evals,
+        population.pop,
+        pop_min,
+        pop_max,
+        accept_rate_history,
+    )
     best_now = float(np_metrics.get("best_now", float("inf")))
+    if growth_control is not None:
+        growth_control.observe(generation_index, best_now)
     if best_history is not None and np.isfinite(best_now):
         best_history.append(best_now)
 
+    old_np = state.np_g
     if num_method == CONSTANT_NP_METHOD:
-        return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty
+        return population
 
     if num_method == ADAPTIVE_NP_METHOD:
         new_np = _adaptive_population_size(
             state,
-            fitness,
-            penalty,
+            population.fitness,
+            population.penalty,
             np_max,
             np_min,
             best_history,
             accept_rate_history,
             evals,
-            pop.shape[1],
+            population.pop.shape[1],
             enable_late_enhancements,
             np_metrics,
         )
     elif num_method == EF_ADAPTIVE_NP_METHOD:
-        old_np = state.np_g
-        feasible_count = int(np.sum(penalty <= 0))
+        feasible_count = int(np.sum(population.penalty <= 0))
         if feasible_count == 0:
-            ef_total = abs(np.sum((penalty - penalty[0]) / (penalty[-1] - penalty[0] - 1e-8)))
+            ef_total = abs(np.sum((population.penalty - population.penalty[0]) / (population.penalty[-1] - population.penalty[0] - 1e-8)))
         elif feasible_count == old_np:
-            ef_total = abs(np.sum((fitness - pop_best_fitness) / (pop_worst_fitness - pop_best_fitness - 1e-8)))
+            ef_total = abs(np.sum((population.fitness - pop_best_fitness) / (pop_worst_fitness - pop_best_fitness - 1e-8)))
         else:
-            pop_feasi_ef = abs(np.sum((fitness[:feasible_count] - pop_best_fitness) / (fitness[feasible_count - 1] - pop_best_fitness - 1e-8)))
-            tail = penalty[feasible_count:]
+            pop_feasi_ef = abs(
+                np.sum(
+                    (population.fitness[:feasible_count] - pop_best_fitness)
+                    / (population.fitness[feasible_count - 1] - pop_best_fitness - 1e-8)
+                )
+            )
+            tail = population.penalty[feasible_count:]
             pop_ufeasi_ef = abs(np.sum((tail - tail[0]) / (tail[-1] - tail[0] - 1e-8))) if tail.size else 0
             ef_total = pop_feasi_ef + pop_ufeasi_ef
 
@@ -1041,36 +1169,25 @@ def num_pop_update(
     else:
         raise ValueError(f"Unsupported population update method: {num_method}; supported methods are {SUPPORTED_NP_METHODS}")
 
-    effective_min = _effective_np_min(np_min, pop.shape[1], enable_late_enhancements, np_metrics)
-    state.np_g = int(np.clip(new_np, effective_min, np_max))
-    row = fitness.size
+    effective_min = _effective_np_min(np_min, population.pop.shape[1], enable_late_enhancements, np_metrics)
+    target_np = int(np.clip(new_np, effective_min, np_max))
+    if target_np > old_np and growth_control is not None:
+        if growth_control.allow_growth(generation_index):
+            growth_control.record_growth(generation_index, best_now)
+        else:
+            target_np = old_np
+    state.np_g = target_np
+    row = population.fitness.size
     if state.np_g > row:
         n_supplement = state.np_g - row
         supplement = generate_population(pop_min, pop_max, n_supplement, evals)
         fit_supp, pen_supp, inf_flags = get_fitness_and_penalty(supplement, evals, opmwade_repair_inf=True)
         state.nfes += n_supplement + int(np.sum(inf_flags != 0))
-        pop = np.vstack([pop, supplement])
-        fitness = np.concatenate([fitness, fit_supp])
-        penalty = np.concatenate([penalty, pen_supp])
-        pop_next = np.vstack([pop_next, supplement])
-        next_fitness = np.concatenate([next_fitness, fit_supp])
-        next_penalty = np.concatenate([next_penalty, pen_supp])
-        pop_pbest = np.vstack([pop_pbest, supplement])
-        pbest_fitness = np.concatenate([pbest_fitness, fit_supp])
-        pbest_penalty = np.concatenate([pbest_penalty, pen_supp])
+        population.append(supplement, fit_supp, pen_supp)
     else:
-        keep = slice(0, state.np_g)
-        pop = pop[keep]
-        fitness = fitness[keep]
-        penalty = penalty[keep]
-        pop_next = pop_next[keep]
-        next_fitness = next_fitness[keep]
-        next_penalty = next_penalty[keep]
-        pop_pbest = pop_pbest[keep]
-        pbest_fitness = pbest_fitness[keep]
-        pbest_penalty = pbest_penalty[keep]
+        population.trim(state.np_g)
 
-    return pop, fitness, penalty, pop_next, next_fitness, next_penalty, pop_pbest, pbest_fitness, pbest_penalty
+    return population
 
 
 def append_population_size_record(process: np.ndarray, state: EvalState) -> np.ndarray:
@@ -1184,6 +1301,17 @@ def run(
             pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
                 pop, fitness, penalty, eps0, pop_pbest, pbest_fitness, pbest_penalty
             )
+            population = PopulationState(
+                pop,
+                fitness,
+                penalty,
+                pop_next,
+                pop_next_fitness,
+                pop_next_penalty,
+                pop_pbest,
+                pbest_fitness,
+                pbest_penalty,
+            )
             pop_best = pop[0].copy()
             pop_best_fitness = float(fitness[0])
             pop_worst_fitness = float(fitness[-1])
@@ -1210,6 +1338,7 @@ def run(
             )
             last_resample_nfes = -state.nfes_max
             last_refine_nfes = -state.nfes_max
+            growth_control = PopulationGrowthControl()
             accept_rate_history: list[float] = []
             reporter.maybe(state, best=current_best, fearate=current_fearate, extra={"iter": 0, "np": state.np_g})
 
@@ -1299,18 +1428,20 @@ def run(
                 sf = sf[accepted_mask]
                 delta_f = delta_f[accepted_mask]
 
-                pop = pop_next.copy()
-                fitness = pop_next_fitness.copy()
-                penalty = pop_next_penalty.copy()
+                population.promote_next()
+                pop, fitness, penalty, pop_next, pop_next_fitness, pop_next_penalty, pop_pbest, pbest_fitness, pbest_penalty = population.as_tuple()
                 sort_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
                     pop, fitness, penalty, eps0, pop_pbest, pbest_fitness, pbest_penalty, sort_metrics
                 )
+                population.set_current(pop, fitness, penalty)
+                population.set_pbest(pop_pbest, pbest_fitness, pbest_penalty)
                 pop_best = pop[0].copy()
                 pop_best_fitness = float(fitness[0])
                 pop_worst_fitness = float(fitness[-1])
                 eps = generate_epsilon(eps0, penalty, sort_metrics)
                 pop_pbest, pbest_fitness, pbest_penalty = update_pop_pbest(pop, fitness, penalty, pop_pbest, pbest_fitness, pbest_penalty, eps)
+                population.set_pbest(pop_pbest, pbest_fitness, pbest_penalty)
                 elite_archive_pop, elite_archive_fitness, elite_archive_penalty = update_elite_archive(
                     elite_archive_pop,
                     elite_archive_fitness,
@@ -1326,90 +1457,49 @@ def run(
                 process = process_best_record(process, pop, fitness, penalty, state.nfes, evals, variant="opmwade")
                 memory_index, mcr, mf = update_mcr_and_mf(memory_index, memory_len, mcr, mf, scr, sf, delta_f)
 
-                pop, fitness, penalty, pop_next, pop_next_fitness, pop_next_penalty, pop_pbest, pbest_fitness, pbest_penalty = num_pop_update(
+                population = num_pop_update(
                     num_method,
                     state,
-                    pop,
-                    fitness,
+                    population,
                     pop_best_fitness,
                     pop_worst_fitness,
                     np_max,
                     np_min,
                     pop_max,
                     pop_min,
-                    pop_best,
-                    pop_next,
                     evals,
-                    penalty,
-                    pop_next_fitness,
-                    pop_next_penalty,
-                    pop_pbest,
-                    pbest_fitness,
-                    pbest_penalty,
                     best_fitness_history,
                     accept_rate_history,
                     enable_late_enhancements,
+                    growth_control,
+                    iteration_index,
                 )
+                pop, fitness, penalty, pop_next, pop_next_fitness, pop_next_penalty, pop_pbest, pbest_fitness, pbest_penalty = population.as_tuple()
                 did_resample = False
                 resample_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
+                eps = generate_epsilon(eps0, penalty, resample_metrics)
                 if enable_late_enhancements and should_resample_stagnated_tail(resample_metrics, state, last_resample_nfes, elite_archive_pop):
-                    (
-                        pop,
-                        fitness,
-                        penalty,
-                        pop_next,
-                        pop_next_fitness,
-                        pop_next_penalty,
-                        pop_pbest,
-                        pbest_fitness,
-                        pbest_penalty,
-                        did_resample,
-                    ) = resample_stagnated_tail(
-                        pop,
-                        fitness,
-                        penalty,
-                        pop_next,
-                        pop_next_fitness,
-                        pop_next_penalty,
-                        pop_pbest,
-                        pbest_fitness,
-                        pbest_penalty,
+                    did_resample = resample_stagnated_tail(
+                        population,
                         elite_archive_pop,
                         pop_max,
                         pop_min,
                         evals,
+                        eps,
                         state,
                         resample_metrics,
                     )
                     if did_resample:
                         last_resample_nfes = state.nfes
+                        pop, fitness, penalty, pop_next, pop_next_fitness, pop_next_penalty, pop_pbest, pbest_fitness, pbest_penalty = population.as_tuple()
                 did_refine = False
                 attempted_refine = False
                 refine_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 eps = generate_epsilon(eps0, penalty, refine_metrics)
                 if enable_late_enhancements and should_local_refine(refine_metrics, state, last_refine_nfes, elite_archive_pop):
                     attempted_refine = True
-                    (
-                        pop,
-                        fitness,
-                        penalty,
-                        pop_next,
-                        pop_next_fitness,
-                        pop_next_penalty,
-                        pop_pbest,
-                        pbest_fitness,
-                        pbest_penalty,
-                        did_refine,
-                    ) = local_refine_elite(
-                        pop,
-                        fitness,
-                        penalty,
-                        pop_next,
-                        pop_next_fitness,
-                        pop_next_penalty,
-                        pop_pbest,
-                        pbest_fitness,
-                        pbest_penalty,
+                    did_refine = local_refine_elite(
+                        population,
                         elite_archive_pop,
                         pop_max,
                         pop_min,
@@ -1420,13 +1510,17 @@ def run(
                     )
                     if did_refine:
                         last_refine_nfes = state.nfes
+                        pop, fitness, penalty, pop_next, pop_next_fitness, pop_next_penalty, pop_pbest, pbest_fitness, pbest_penalty = population.as_tuple()
                 population_size_process = append_population_size_record(population_size_process, state)
                 sort_metrics = _search_metrics(state, fitness, penalty, best_fitness_history, evals, pop, pop_min, pop_max, accept_rate_history)
                 pop, fitness, penalty, num_p1, num_p2, _, pop_pbest, pbest_fitness, pbest_penalty, class_labels = sort_by_constraint(
                     pop, fitness, penalty, eps0, pop_pbest, pbest_fitness, pbest_penalty, sort_metrics
                 )
+                population.set_current(pop, fitness, penalty)
+                population.set_pbest(pop_pbest, pbest_fitness, pbest_penalty)
                 if did_resample or did_refine:
                     pop_pbest, pbest_fitness, pbest_penalty = update_pop_pbest(pop, fitness, penalty, pop_pbest, pbest_fitness, pbest_penalty, eps)
+                    population.set_pbest(pop_pbest, pbest_fitness, pbest_penalty)
                     elite_archive_pop, elite_archive_fitness, elite_archive_penalty = update_elite_archive(
                         elite_archive_pop,
                         elite_archive_fitness,
